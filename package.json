@@ -1,0 +1,35 @@
+{
+  "name": "media-to-3d-backend",
+  "version": "1.0.0",
+  "description": "사용자가 미디어 파일을 업로드하면 관리자가 3D 결과를 제공하는 웹 서비스 백엔드",
+  "main": "src/app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js"
+  },
+  "keywords": [
+    "node",
+    "express",
+    "aws",
+    "s3",
+    "jwt",
+    "upload",
+    "backend"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.540.0",
+    "@aws-sdk/s3-request-presigner": "^3.540.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}

@@ -1,17 +1,22 @@
 import express from 'express';
+import dotenv from "dotenv"
 import cors from 'cors';
 import authRouter from '../routes/auth.js';
 import { authMiddleware } from './middlewares/authMiddleware.js';
 import adminRoutes from "./routes/adminRoutes.js";
 
+dotenv.config();
+
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT;
 
 // ⚠️ 나중에 .env로 빼면 됨
 export const JWT_SECRET = 'DEV_SECRET_KEY';
 
 app.use(cors());
+app.use(express.static('public')); 
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 app.use('/api/auth', authRouter);
 app.use("/api/admin", adminRoutes);

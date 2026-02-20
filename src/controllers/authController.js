@@ -3,7 +3,7 @@ import { JWT_SECRET } from '../app.js';
 import {
   findUserByEmail,
   createUser
-} from '../../services/userService.js';
+} from '../services/userService.js';
 
 // 로그인
 export async function login(req, res) {

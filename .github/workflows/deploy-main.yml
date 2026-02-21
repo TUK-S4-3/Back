@@ -109,55 +109,55 @@ jobs:
           set -euo pipefail
 
           cat >/tmp/deploy-main.sh <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-APP_DIR="/opt/app"
-REPO_URL="${REPO_URL}"
-DEPLOY_BRANCH="${DEPLOY_BRANCH}"
-APP_USER="ubuntu"
+          APP_DIR="/opt/app"
+          REPO_URL="${REPO_URL}"
+          DEPLOY_BRANCH="${DEPLOY_BRANCH}"
+          APP_USER="ubuntu"
 
-sudo mkdir -p "\$APP_DIR"
-sudo chown -R "\$APP_USER:\$APP_USER" "\$APP_DIR"
+          sudo mkdir -p "\$APP_DIR"
+          sudo chown -R "\$APP_USER:\$APP_USER" "\$APP_DIR"
 
-sudo -u "\$APP_USER" bash -lc "
-  set -euo pipefail
-  if [ ! -d \"\$APP_DIR/.git\" ]; then
-    git -C \"\$APP_DIR\" init
-  fi
-  if git -C \"\$APP_DIR\" remote get-url origin >/dev/null 2>&1; then
-    git -C \"\$APP_DIR\" remote set-url origin \"\$REPO_URL\"
-  else
-    git -C \"\$APP_DIR\" remote add origin \"\$REPO_URL\"
-  fi
-  git -C \"\$APP_DIR\" fetch --depth 1 origin \"\$DEPLOY_BRANCH\"
-  git -C \"\$APP_DIR\" reset --hard FETCH_HEAD
-  git -C \"\$APP_DIR\" clean -fd
-  npm install --prefix \"\$APP_DIR\"
-"
+          sudo -u "\$APP_USER" bash -lc "
+            set -euo pipefail
+            if [ ! -d \"\$APP_DIR/.git\" ]; then
+              git -C \"\$APP_DIR\" init
+            fi
+            if git -C \"\$APP_DIR\" remote get-url origin >/dev/null 2>&1; then
+              git -C \"\$APP_DIR\" remote set-url origin \"\$REPO_URL\"
+            else
+              git -C \"\$APP_DIR\" remote add origin \"\$REPO_URL\"
+            fi
+            git -C \"\$APP_DIR\" fetch --depth 1 origin \"\$DEPLOY_BRANCH\"
+            git -C \"\$APP_DIR\" reset --hard FETCH_HEAD
+            git -C \"\$APP_DIR\" clean -fd
+            npm install --prefix \"\$APP_DIR\"
+          "
 
-cat <<'SERVICE' | sudo tee /etc/systemd/system/app.service >/dev/null
-[Unit]
-Description=UMC 7th Project
-After=network.target
+          cat <<'SERVICE' | sudo tee /etc/systemd/system/app.service >/dev/null
+          [Unit]
+          Description=UMC 7th Project
+          After=network.target
 
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/opt/app
-ExecStart=/usr/bin/npm run dev --prefix /opt/app/
-Restart=always
-RestartSec=3
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/opt/app
+          ExecStart=/usr/bin/npm run dev --prefix /opt/app/
+          Restart=always
+          RestartSec=3
 
-[Install]
-WantedBy=multi-user.target
-SERVICE
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
 
-sudo systemctl daemon-reload
-sudo systemctl enable app
-sudo systemctl restart app
-sudo systemctl is-active app
-EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable app
+          sudo systemctl restart app
+          sudo systemctl is-active app
+          EOF
 
           DEPLOY_B64=$(base64 -w 0 /tmp/deploy-main.sh)
 

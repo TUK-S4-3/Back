@@ -1,9 +1,10 @@
 import express from 'express';
 import dotenv from "dotenv"
 import cors from 'cors';
-import authRouter from '../routes/auth.js';
+import authRouter from './routes/auth.js';
 import { authMiddleware } from './middlewares/authMiddleware.js';
 import adminRoutes from "./routes/adminRoutes.js";
+import uploadRoutes from "./routes/uploadRoutes.js";
 
 dotenv.config();
 

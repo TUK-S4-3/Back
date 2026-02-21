@@ -21,6 +21,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check prisma has changes
+        id: paths-filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            prisma:
+              - 'prisma/**'
+
       - name: Validate required AWS values
         run: |
           for key in AWS_REGION AWS_ROLE_TO_ASSUME EC2_INSTANCE_ID; do
@@ -105,6 +113,7 @@ jobs:
         env:
           REPO_URL: https://github.com/${{ github.repository }}.git
           DEPLOY_BRANCH: main
+          PRISMA_CHANGED: ${{ steps.paths-filter.outputs.prisma }}
         run: |
           set -euo pipefail
 
@@ -115,12 +124,13 @@ jobs:
           APP_DIR="/opt/app"
           REPO_URL="${REPO_URL}"
           DEPLOY_BRANCH="${DEPLOY_BRANCH}"
+          PRISMA_CHANGED="${PRISMA_CHANGED}"
           APP_USER="ubuntu"
 
           sudo mkdir -p "\$APP_DIR"
           sudo chown -R "\$APP_USER:\$APP_USER" "\$APP_DIR"
 
-          sudo -u "\$APP_USER" bash -lc "
+          sudo -u "\$APP_USER" PRISMA_CHANGED="\$PRISMA_CHANGED" bash -lc "
             set -euo pipefail
             if [ ! -d \"\$APP_DIR/.git\" ]; then
               git -C \"\$APP_DIR\" init
@@ -134,6 +144,16 @@ jobs:
             git -C \"\$APP_DIR\" reset --hard FETCH_HEAD
             git -C \"\$APP_DIR\" clean -fd
             npm install --prefix \"\$APP_DIR\"
+            if [ -f \"\$APP_DIR/prisma/schema.prisma\" ] && [ -x \"\$APP_DIR/node_modules/.bin/prisma\" ]; then
+              npm exec --prefix \"\$APP_DIR\" prisma generate
+            fi
+            if [ \"\$PRISMA_CHANGED\" = \"true\" ]; then
+              if [ ! -f \"\$APP_DIR/prisma/schema.prisma\" ] || [ ! -x \"\$APP_DIR/node_modules/.bin/prisma\" ]; then
+                echo \"Prisma migrate prerequisites are missing\"
+                exit 1
+              fi
+              npm exec --prefix \"\$APP_DIR\" prisma migrate deploy
+            fi
           "
 
           cat <<'SERVICE' | sudo tee /etc/systemd/system/app.service >/dev/null

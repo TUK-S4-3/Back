@@ -8,6 +8,7 @@
 
 datasource db {
   provider = "mysql"
+  url      = env("DATABASE_URL")
 }
 
 generator client {
@@ -187,4 +188,13 @@ model likes {
   @@index([postId, createdAt], map: "idx_likes_post_created")
   @@index([userId, createdAt], map: "idx_likes_user_created")
   @@map("likes")
+}
+
+model Session {
+  id        String   @id
+  sid       String   @unique
+  data      String   @db.Text
+  expiresAt DateTime @map("expires_at")
+
+  @@map("session")
 }

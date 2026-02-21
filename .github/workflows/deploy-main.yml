@@ -145,14 +145,14 @@ jobs:
             git -C \"\$APP_DIR\" clean -fd
             npm install --prefix \"\$APP_DIR\"
             if [ -f \"\$APP_DIR/prisma/schema.prisma\" ] && [ -x \"\$APP_DIR/node_modules/.bin/prisma\" ]; then
-              npm exec --prefix \"\$APP_DIR\" prisma generate
+              npm exec --prefix \"\$APP_DIR\" -- prisma generate --schema \"\$APP_DIR/prisma/schema.prisma\"
             fi
             if [ \"\$PRISMA_CHANGED\" = \"true\" ]; then
               if [ ! -f \"\$APP_DIR/prisma/schema.prisma\" ] || [ ! -x \"\$APP_DIR/node_modules/.bin/prisma\" ]; then
                 echo \"Prisma migrate prerequisites are missing\"
                 exit 1
               fi
-              npm exec --prefix \"\$APP_DIR\" prisma migrate deploy
+              npm exec --prefix \"\$APP_DIR\" -- prisma migrate deploy --schema \"\$APP_DIR/prisma/schema.prisma\"
             fi
           "
 

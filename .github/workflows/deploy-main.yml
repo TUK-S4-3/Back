@@ -6,62 +6,200 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME || secrets.AWS_ROLE_TO_ASSUME }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID || secrets.EC2_INSTANCE_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure SSH
+      - name: Validate required AWS values
         run: |
-          mkdir -p ~/.ssh
-          echo "$EC2_SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          for key in AWS_REGION AWS_ROLE_TO_ASSUME EC2_INSTANCE_ID; do
+            if [ -z "${!key}" ]; then
+              echo "Missing required value: $key"
+              exit 1
+            fi
+          done
 
-          cat >>~/.ssh/config <<END
-          Host ec2-target
-            HostName $EC2_HOST
-            User $EC2_USER
-            IdentityFile ~/.ssh/id_rsa
-            StrictHostKeyChecking no
-          END
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify assumed role identity
+        run: aws sts get-caller-identity
+
+      - name: Check SSM managed instance status
+        run: |
+          set -euo pipefail
+          PING_STATUS=$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=$EC2_INSTANCE_ID" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text)
+
+          echo "ping_status=$PING_STATUS"
+
+          if [ "$PING_STATUS" != "Online" ]; then
+            echo "SSM agent is not Online for instance: $EC2_INSTANCE_ID"
+            exit 1
+          fi
+
+      - name: SSM smoke test
+        run: |
+          set -euo pipefail
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --comment "SSM smoke test from GitHub Actions" \
+            --parameters commands='["echo SSM_OK","whoami","uname -a"]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=$COMMAND_ID"
+
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}'
+                break
+                ;;
+              Failed|TimedOut|Cancelled|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}'
+                exit 1
+                ;;
+              *)
+                sleep 5
+                ;;
+            esac
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM smoke test timed out"
+            exit 1
+          fi
+
+      - name: Deploy to EC2 via SSM
         env:
-          EC2_USER: ubuntu
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-
-      - name: Copy Workspace
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          DEPLOY_BRANCH: main
         run: |
-          ssh ec2-target 'sudo mkdir -p /opt/app'
-          ssh ec2-target 'sudo chown ubuntu:ubuntu /opt/app'
-          scp -r ./[!.]* ec2-target:/opt/app
+          set -euo pipefail
 
-      - name: Install dependencies
-        run: |
-          ssh ec2-target 'npm install --prefix /opt/app/'
+          cat >/tmp/deploy-main.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
 
-      - name: Copy systemd service file
-        run: |
-          ssh ec2-target '
-            echo "[Unit]
-            Description=UMC 7th Project
-            After=network.target
+APP_DIR="/opt/app"
+REPO_URL="${REPO_URL}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH}"
+APP_USER="ubuntu"
 
-            [Service]
-            User=${USER}
-            ExecStart=/usr/bin/npm run dev --prefix /opt/app/
-            Restart=always
+sudo mkdir -p "\$APP_DIR"
+sudo chown -R "\$APP_USER:\$APP_USER" "\$APP_DIR"
 
-            [Install]
-            WantedBy=multi-user.target" | sudo tee /etc/systemd/system/app.service
-          '
+sudo -u "\$APP_USER" bash -lc "
+  set -euo pipefail
+  if [ ! -d \"\$APP_DIR/.git\" ]; then
+    git -C \"\$APP_DIR\" init
+  fi
+  if git -C \"\$APP_DIR\" remote get-url origin >/dev/null 2>&1; then
+    git -C \"\$APP_DIR\" remote set-url origin \"\$REPO_URL\"
+  else
+    git -C \"\$APP_DIR\" remote add origin \"\$REPO_URL\"
+  fi
+  git -C \"\$APP_DIR\" fetch --depth 1 origin \"\$DEPLOY_BRANCH\"
+  git -C \"\$APP_DIR\" reset --hard FETCH_HEAD
+  git -C \"\$APP_DIR\" clean -fd
+  npm install --prefix \"\$APP_DIR\"
+"
 
-      - name: Enable systemd service
-        run: |
-          ssh ec2-target 'sudo systemctl daemon-reload'
-          ssh ec2-target 'sudo systemctl enable app'
+cat <<'SERVICE' | sudo tee /etc/systemd/system/app.service >/dev/null
+[Unit]
+Description=UMC 7th Project
+After=network.target
 
-      - name: Restart systemd service
-        run: |
-          ssh ec2-target 'sudo systemctl restart app'
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/app
+ExecStart=/usr/bin/npm run dev --prefix /opt/app/
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+sudo systemctl daemon-reload
+sudo systemctl enable app
+sudo systemctl restart app
+sudo systemctl is-active app
+EOF
+
+          DEPLOY_B64=$(base64 -w 0 /tmp/deploy-main.sh)
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --comment "Deploy main via SSM" \
+            --parameters commands="[\"echo '$DEPLOY_B64' | base64 -d > /tmp/deploy-main.sh\",\"chmod +x /tmp/deploy-main.sh\",\"/tmp/deploy-main.sh\"]" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=$COMMAND_ID"
+
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}'
+                break
+                ;;
+              Failed|TimedOut|Cancelled|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query '{Status:Status,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}'
+                exit 1
+                ;;
+              *)
+                sleep 5
+                ;;
+            esac
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Deployment command timed out"
+            exit 1
+          fi

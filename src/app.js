@@ -22,6 +22,15 @@ app.use(express.urlencoded({ extended: false }));
 app.use('/api/auth', authRouter);
 app.use("/api/admin", adminRoutes);
 
+// 테스트용 헬스 체크 API
+app.get('/api/test', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    message: 'test api response',
+    timestamp: new Date().toISOString()
+  });
+});
+
 // 🔐 로그인된 사용자만 접근 가능
 app.get('/api/me', authMiddleware, (req, res) => {
   res.json({

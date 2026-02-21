@@ -1,0 +1,190 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+// schema.prisma
+
+datasource db {
+  provider = "mysql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/* =========================
+   ENUMS
+========================= */
+
+enum Provider {
+  KAKAO
+  NAVER
+  GOOGLE
+}
+
+enum UserStatus {
+  ACTIVE
+  DELETED
+}
+
+enum SceneStatus {
+  DRAFT
+  UPLOADING
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+  CANCELLED
+}
+
+enum JobStatus {
+  QUEUED
+  SUBMITTED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum JobStage {
+  INSTANCE_CREATING
+  IMAGESET_BUILDING
+  SFM
+  GS_TRAINING
+  MESH_EXTRACTION
+  FINALIZING
+}
+
+enum PostStatus {
+  PUBLISHED
+  DELETED
+}
+
+/* =========================
+   MODELS
+========================= */
+
+model users {
+  id              BigInt     @id @default(autoincrement()) @db.UnsignedBigInt
+  provider        Provider
+  providerId      String     @db.VarChar(128) @map("provider_id")
+  nickname        String?    @db.VarChar(50)
+  profileImageUrl String?    @db.VarChar(255) @map("profile_image_url")
+  status          UserStatus @default(ACTIVE)
+
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  // Relations
+  scenes          scenes[]
+  posts           posts[]
+  likes           likes[]
+
+  @@unique([provider, providerId], map: "uk_provider_provider_id")
+  @@unique([nickname], map: "uk_nickname")
+  @@map("users")
+}
+
+model scenes {
+  id              BigInt      @id @default(autoincrement()) @db.UnsignedBigInt
+  userId          BigInt      @db.UnsignedBigInt @map("user_id")
+  title           String      @default("Untitled Scene") @db.VarChar(100)
+  status          SceneStatus @default(DRAFT)
+
+  inputVideoKey     String?   @db.VarChar(1024) @map("input_video_key")
+  sfmResultKey      String?   @db.VarChar(1024) @map("sfm_result_key")
+  gaussianSplatKey  String?   @db.VarChar(1024) @map("gaussian_splat_key")
+  meshKey           String?   @db.VarChar(1024) @map("mesh_key")
+  thumbnailKey      String?   @db.VarChar(1024) @map("thumbnail_key")
+
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+  finishedAt      DateTime?   @map("finished_at")
+
+  // Relations
+  user            users       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs            jobs[]
+  posts           posts[]
+
+  @@index([userId, createdAt], map: "idx_scenes_user_created")
+  @@index([status], map: "idx_scenes_status")
+  @@map("scenes")
+}
+
+model jobs {
+  id              BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  sceneId         BigInt    @db.UnsignedBigInt @map("scene_id")
+
+  batchJobId      String?   @db.VarChar(128) @map("batch_job_id")
+
+  status          JobStatus @default(QUEUED)
+  stage           JobStage  @default(INSTANCE_CREATING)
+
+  progressPercent Int       @default(0) @db.UnsignedTinyInt @map("progress_percent")
+  cancelRequested Boolean   @default(false) @map("cancel_requested")
+
+  attempt         Int       @default(0) @db.UnsignedInt
+  errorCode       String?   @db.VarChar(50) @map("error_code")
+  errorMessage    String?   @db.VarChar(255) @map("error_message")
+
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  startedAt       DateTime? @map("started_at")
+  endedAt         DateTime? @map("ended_at")
+
+  // Relations
+  scene           scenes    @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+
+  @@unique([batchJobId], map: "uk_batch_job_id")
+  @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
+  @@index([status, createdAt], map: "idx_jobs_status_created")
+  @@index([stage], map: "idx_jobs_stage")
+  @@map("jobs")
+}
+
+model posts {
+  id            BigInt     @id @default(autoincrement()) @db.UnsignedBigInt
+  userId        BigInt     @db.UnsignedBigInt @map("user_id")
+  sceneId       BigInt     @db.UnsignedBigInt @map("scene_id")
+
+  title         String     @db.VarChar(100)
+  status        PostStatus @default(PUBLISHED)
+
+  likeCount     Int        @default(0) @db.UnsignedInt @map("like_count")
+  downloadCount Int        @default(0) @db.UnsignedInt @map("download_count")
+
+  shareUuid     String     @db.Char(36) @map("share_uuid")
+
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  // Relations
+  user          users      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scene         scenes     @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  likes         likes[]
+
+  @@unique([shareUuid], map: "uk_posts_share_uuid")
+  @@index([userId, createdAt], map: "idx_posts_user_created")
+  @@index([sceneId], map: "idx_posts_scene")
+  @@index([createdAt], map: "idx_posts_created")
+  @@index([likeCount, createdAt], map: "idx_posts_like")
+  @@index([downloadCount, createdAt], map: "idx_posts_download")
+  @@map("posts")
+}
+
+model likes {
+  userId    BigInt   @db.UnsignedBigInt @map("user_id")
+  postId    BigInt   @db.UnsignedBigInt @map("post_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user      users    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post      posts    @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@id([userId, postId])
+  @@index([postId, createdAt], map: "idx_likes_post_created")
+  @@index([userId, createdAt], map: "idx_likes_user_created")
+  @@map("likes")
+}

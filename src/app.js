@@ -6,6 +6,7 @@ import { authMiddleware } from './middlewares/authMiddleware.js';
 import adminRoutes from "./routes/adminRoutes.js";
 import uploadRoutes from "./routes/uploadRoutes.js";
 import oauthRouter from "./routes/oauthRouter.js";
+import videoRoutes from "./routes/videoRoutes.js";
 import { PrismaSessionStore } from "@quixo3/prisma-session-store";
 import session from "express-session";
 import passport from "passport";
@@ -73,6 +74,7 @@ app.use('/api/auth', authRouter);
 app.use("/api/admin", adminRoutes);
 app.use("/api/oauth2", oauthRouter)
 app.use("/api/uploads", uploadRoutes);
+app.use("/api/videos", videoRoutes);
 
 
 // 테스트용 헬스 체크 API

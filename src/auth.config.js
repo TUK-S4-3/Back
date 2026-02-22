@@ -8,7 +8,7 @@ export const googleStrategy = new GoogleStrategy(
   {
     clientID: process.env.PASSPORT_GOOGLE_CLIENT_ID,
     clientSecret: process.env.PASSPORT_GOOGLE_CLIENT_SECRET,
-    callbackURL: "http://localhost:3000/api/oauth2/callback/google",
+    callbackURL: process.env.GOOGLE_CALLBACK_URL,
     scope: ["email", "profile"],
     state: true,
   },

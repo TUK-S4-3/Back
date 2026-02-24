@@ -1,6 +1,9 @@
 import express from "express";
 import { sessionAuthMiddleware } from "../middlewares/sessionAuthMiddleware.js";
-import { issueVideoUploadPresign } from "../controllers/videoController.js";
+import {
+  completeVideoUpload,
+  issueVideoUploadPresign
+} from "../controllers/videoController.js";
 
 const router = express.Router();
 
@@ -12,6 +15,16 @@ router.post(
   "/presign",
   sessionAuthMiddleware,
   issueVideoUploadPresign
+);
+
+/**
+ * 영상 업로드 완료 신고
+ * POST /api/videos/complete
+ */
+router.post(
+  "/complete",
+  sessionAuthMiddleware,
+  completeVideoUpload
 );
 
 export default router;

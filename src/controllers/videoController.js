@@ -16,10 +16,6 @@ function parseBigInt(value) {
   }
 }
 
-function sanitizeFilename(filename) {
-  return filename.trim().replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
 function getUploadingSceneTtlMinutes() {
   const raw = Number(process.env.UPLOADING_SCENE_TTL_MINUTES);
   if (Number.isFinite(raw) && raw > 0) {
@@ -28,8 +24,8 @@ function getUploadingSceneTtlMinutes() {
   return DEFAULT_UPLOADING_SCENE_TTL_MINUTES;
 }
 
-function buildExpectedVideoInputPrefix(userId, sceneId) {
-  return `videos/input/${userId}/${sceneId}/`;
+function buildExpectedVideoInputPrefix(sceneId) {
+  return `scenes/${sceneId}/input/video/`;
 }
 
 async function cleanupExpiredUploadingScenes() {
@@ -99,8 +95,8 @@ export async function issueVideoUploadPresign(req, res) {
       }
     });
 
-    const safeFilename = sanitizeFilename(filename);
-    const key = `videos/input/${userId.toString()}/${scene.id.toString()}/${uuid()}_${safeFilename}`;
+    const uploadId = uuid();
+    const key = `scenes/${scene.id.toString()}/input/video/${uploadId}.mp4`;
 
     const command = new PutObjectCommand({
       Bucket: bucketName,
@@ -195,10 +191,7 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
-    const expectedPrefix = buildExpectedVideoInputPrefix(
-      userId.toString(),
-      parsedSceneId.toString()
-    );
+    const expectedPrefix = buildExpectedVideoInputPrefix(parsedSceneId.toString());
 
     if (!normalizedKey.startsWith(expectedPrefix)) {
       return res.status(400).json({

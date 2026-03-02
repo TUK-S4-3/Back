@@ -3,11 +3,13 @@ import dotenv from "dotenv"
 import cors from 'cors';
 import oauthRouter from "./routes/oauthRouter.js";
 import videoRoutes from "./routes/videoRoutes.js";
+import v1Routes from "./routes/v1Routes.js";
 import { PrismaSessionStore } from "@quixo3/prisma-session-store";
 import session from "express-session";
 import passport from "passport";
 import { googleStrategy } from "./auth.config.js";
 import { prisma } from "./db.config.js";
+import { traceIdMiddleware } from "./middlewares/traceIdMiddleware.js";
 
 dotenv.config();
 
@@ -64,6 +66,7 @@ app.use(
 app.use(express.static('public')); 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+app.use(traceIdMiddleware);
 app.use(
   session({
     cookie: sessionCookieOptions,
@@ -248,6 +251,7 @@ app.post("/api/auth/logout", (req, res) => {
 
 app.use("/api/oauth2", oauthRouter)
 app.use("/api/videos", videoRoutes);
+app.use("/api/v1", v1Routes);
 
 
 // 테스트용 헬스 체크 API

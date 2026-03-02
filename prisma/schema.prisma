@@ -93,6 +93,7 @@ model scenes {
   userId          BigInt      @db.UnsignedBigInt @map("user_id")
   title           String      @default("Untitled Scene") @db.VarChar(100)
   status          SceneStatus @default(DRAFT)
+  uploadId        String?     @db.Char(36) @map("upload_id")
 
   inputVideoKey     String?   @db.VarChar(1024) @map("input_video_key")
   sfmResultKey      String?   @db.VarChar(1024) @map("sfm_result_key")
@@ -111,6 +112,7 @@ model scenes {
 
   @@index([userId, createdAt], map: "idx_scenes_user_created")
   @@index([status], map: "idx_scenes_status")
+  @@index([uploadId], map: "idx_scenes_upload_id")
   @@map("scenes")
 }
 
@@ -119,6 +121,7 @@ model jobs {
   sceneId         BigInt    @db.UnsignedBigInt @map("scene_id")
 
   batchJobId      String?   @db.VarChar(128) @map("batch_job_id")
+  uploadId        String?   @db.Char(36) @map("upload_id")
 
   status          JobStatus @default(QUEUED)
   stage           JobStage  @default(INSTANCE_CREATING)
@@ -142,6 +145,7 @@ model jobs {
   @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
   @@index([status, createdAt], map: "idx_jobs_status_created")
   @@index([stage], map: "idx_jobs_stage")
+  @@index([uploadId], map: "idx_jobs_upload_id")
   @@map("jobs")
 }
 

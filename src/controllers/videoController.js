@@ -7,6 +7,7 @@ import { s3 } from "../utils/s3.js";
 const ALLOWED_VIDEO_CONTENT_TYPES = ["video/mp4"];
 const PRESIGNED_URL_EXPIRES_IN_SECONDS = 60 * 5;
 const DEFAULT_UPLOADING_SCENE_TTL_MINUTES = 60;
+const SCENE_LIST_PAGE_SIZE = 5;
 
 function parseBigInt(value) {
   try {
@@ -14,6 +15,14 @@ function parseBigInt(value) {
   } catch {
     return null;
   }
+}
+
+function parsePositiveInt(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return null;
+  }
+  return parsed;
 }
 
 function getUploadingSceneTtlMinutes() {
@@ -88,14 +97,15 @@ export async function issueVideoUploadPresign(req, res) {
       });
     }
 
+    const uploadId = uuid();
     const scene = await prisma.scenes.create({
       data: {
         userId,
-        status: "UPLOADING"
+        status: "UPLOADING",
+        uploadId
       }
     });
 
-    const uploadId = uuid();
     const key = `scenes/${scene.id.toString()}/input/video/${uploadId}.mp4`;
 
     const command = new PutObjectCommand({
@@ -111,6 +121,7 @@ export async function issueVideoUploadPresign(req, res) {
     return res.status(201).json({
       ok: true,
       sceneId: scene.id.toString(),
+      uploadId,
       key,
       url,
       expiresIn: PRESIGNED_URL_EXPIRES_IN_SECONDS
@@ -200,6 +211,21 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
+    const sceneUploadId =
+      typeof scene.uploadId === "string" && scene.uploadId.trim().length > 0
+        ? scene.uploadId.trim()
+        : null;
+
+    if (sceneUploadId) {
+      const expectedKey = `${expectedPrefix}${sceneUploadId}.mp4`;
+      if (normalizedKey !== expectedKey) {
+        return res.status(400).json({
+          ok: false,
+          message: "scene의 uploadId와 일치하지 않는 key입니다."
+        });
+      }
+    }
+
     if (scene.status === "UPLOADED" && scene.inputVideoKey === normalizedKey) {
       return res.status(200).json({
         ok: true,
@@ -266,6 +292,87 @@ export async function completeVideoUpload(req, res) {
     return res.status(500).json({
       ok: false,
       message: "영상 업로드 완료 처리 실패"
+    });
+  }
+}
+
+/**
+ * 로그인 사용자 본인 scene 목록 조회
+ * GET /api/videos/scenes?page=1
+ */
+export async function listMyScenes(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return res.status(401).json({
+        ok: false,
+        message: "세션 사용자 정보가 유효하지 않습니다."
+      });
+    }
+
+    const pageParam = req.query?.page;
+    const page = pageParam === undefined ? 1 : parsePositiveInt(pageParam);
+    if (page === null) {
+      return res.status(400).json({
+        ok: false,
+        message: "page는 1 이상의 정수여야 합니다."
+      });
+    }
+
+    const skip = (page - 1) * SCENE_LIST_PAGE_SIZE;
+
+    const [totalCount, scenes] = await prisma.$transaction([
+      prisma.scenes.count({
+        where: {
+          userId
+        }
+      }),
+      prisma.scenes.findMany({
+        where: {
+          userId
+        },
+        orderBy: {
+          createdAt: "desc"
+        },
+        skip,
+        take: SCENE_LIST_PAGE_SIZE,
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          uploadId: true,
+          inputVideoKey: true,
+          sfmResultKey: true,
+          gaussianSplatKey: true,
+          meshKey: true,
+          thumbnailKey: true,
+          createdAt: true,
+          updatedAt: true,
+          finishedAt: true
+        }
+      })
+    ]);
+
+    const totalPages =
+      totalCount === 0 ? 0 : Math.ceil(totalCount / SCENE_LIST_PAGE_SIZE);
+
+    return res.status(200).json({
+      ok: true,
+      page,
+      pageSize: SCENE_LIST_PAGE_SIZE,
+      totalCount,
+      totalPages,
+      hasNext: page < totalPages,
+      items: scenes.map((scene) => ({
+        ...scene,
+        id: scene.id.toString()
+      }))
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      ok: false,
+      message: "scene 목록 조회 실패"
     });
   }
 }

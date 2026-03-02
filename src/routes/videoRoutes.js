@@ -2,7 +2,8 @@ import express from "express";
 import { sessionAuthMiddleware } from "../middlewares/sessionAuthMiddleware.js";
 import {
   completeVideoUpload,
-  issueVideoUploadPresign
+  issueVideoUploadPresign,
+  listMyScenes
 } from "../controllers/videoController.js";
 
 const router = express.Router();
@@ -25,6 +26,16 @@ router.post(
   "/complete",
   sessionAuthMiddleware,
   completeVideoUpload
+);
+
+/**
+ * 로그인 사용자 본인 scene 목록 조회
+ * GET /api/videos/scenes?page=1
+ */
+router.get(
+  "/scenes",
+  sessionAuthMiddleware,
+  listMyScenes
 );
 
 export default router;

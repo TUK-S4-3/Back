@@ -714,6 +714,7 @@ export async function listSceneJobs(req, res) {
 
     return res.status(200).json({
       sceneId: toResponseId(loadedScene.scene.id),
+      inputVideoKey: loadedScene.scene.inputVideoKey ?? null,
       jobs: jobs.map((job) => {
         const status = mapJobStatus(job.status);
         return {

@@ -74,7 +74,7 @@ export async function issueVideoUploadPresign(req, res) {
       });
     }
 
-    const { filename, contentType } = req.body ?? {};
+    const { filename, contentType, title } = req.body ?? {};
 
     if (typeof filename !== "string" || filename.trim().length === 0) {
       return res.status(400).json({
@@ -97,12 +97,31 @@ export async function issueVideoUploadPresign(req, res) {
       });
     }
 
+    let normalizedTitle = null;
+    if (title !== undefined && title !== null) {
+      if (typeof title !== "string" || title.trim().length === 0) {
+        return res.status(400).json({
+          ok: false,
+          message: "title은 비어있을 수 없습니다."
+        });
+      }
+
+      normalizedTitle = title.trim();
+      if (normalizedTitle.length > 100) {
+        return res.status(400).json({
+          ok: false,
+          message: "title은 100자 이하여야 합니다."
+        });
+      }
+    }
+
     const uploadId = uuid();
     const scene = await prisma.scenes.create({
       data: {
         userId,
         status: "UPLOADING",
-        uploadId
+        uploadId,
+        ...(normalizedTitle ? { title: normalizedTitle } : {})
       }
     });
 

@@ -1,15 +1,57 @@
-import { GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { prisma } from "../db.config.js";
 import { sendApiError } from "../utils/apiError.js";
-import { s3 } from "../utils/s3.js";
-import { streamToString } from "../utils/stream.js";
+import {
+  buildJobReadModel,
+  buildThumbnailSummary,
+  DEFAULT_PIPELINE,
+  getMetaKeys,
+  VIEWER_FORMAT
+} from "../utils/jobPresentation.js";
 
-const DEFAULT_PIPELINE = "3dgs";
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
-const READY_STATUS = "ready";
-const VIEWER_FORMAT = "ply";
-const TERMINAL_STATUSES = new Set(["ready", "failed", "canceled"]);
+
+const jobBaseSelect = {
+  id: true,
+  sceneId: true,
+  status: true,
+  stage: true,
+  progressPercent: true,
+  errorMessage: true,
+  batchJobId: true,
+  updatedAt: true,
+  startedAt: true,
+  endedAt: true,
+  createdAt: true,
+  pipeline: true,
+  imageCount: true,
+  overlap: true,
+  iteration: true,
+  sfmResultKey: true,
+  gaussianSplatKey: true,
+  meshKey: true,
+  thumbnailKey: true,
+  post: {
+    select: {
+      id: true,
+      status: true,
+      thumbnailKey: true,
+      thumbnailUpdatedAt: true,
+      updatedAt: true
+    }
+  },
+  scene: {
+    select: {
+      id: true,
+      userId: true,
+      updatedAt: true,
+      gaussianSplatKey: true,
+      meshKey: true,
+      sfmResultKey: true,
+      thumbnailKey: true
+    }
+  }
+};
 
 function parseBigInt(value) {
   try {
@@ -103,299 +145,13 @@ function toResponseId(value) {
   return value.toString();
 }
 
-function mapJobStatus(status) {
-  switch (status) {
-    case "QUEUED":
-    case "SUBMITTED":
-      return "queued";
-    case "RUNNING":
-      return "processing";
-    case "SUCCEEDED":
-      return READY_STATUS;
-    case "FAILED":
-      return "failed";
-    case "CANCELLED":
-      return "canceled";
-    default:
-      return "processing";
-  }
-}
-
-function normalizeApiStatus(value) {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  switch (normalized) {
-    case "queued":
-    case "submitted":
-    case "pending":
-    case "runnable":
-    case "starting":
-      return "queued";
-    case "running":
-    case "processing":
-      return "processing";
-    case "succeeded":
-    case "success":
-    case "ready":
-    case "done":
-      return READY_STATUS;
-    case "failed":
-    case "error":
-      return "failed";
-    case "cancelled":
-    case "canceled":
-      return "canceled";
-    default:
-      return null;
-  }
-}
-
-function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function clamp(number, min, max) {
-  return Math.min(Math.max(number, min), max);
-}
-
-function toIsoStringOrNull(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-
-  return date.toISOString();
-}
-
-function resolveUpdatedAt(fallbackDate, progressDoc, statusDoc) {
-  const candidates = [progressDoc?.updatedAt, statusDoc?.updatedAt];
-  for (const candidate of candidates) {
-    const iso = toIsoStringOrNull(candidate);
-    if (iso) {
-      return iso;
-    }
-  }
-
-  return fallbackDate.toISOString();
-}
-
-function resolveStage(fallbackStage, progressDoc, statusDoc) {
-  const fromProgress = progressDoc?.stage;
-  if (typeof fromProgress === "string" && fromProgress.trim().length > 0) {
-    return fromProgress.trim();
-  }
-
-  const fromStatus = statusDoc?.stage;
-  if (typeof fromStatus === "string" && fromStatus.trim().length > 0) {
-    return fromStatus.trim();
-  }
-
-  if (typeof fallbackStage === "string" && fallbackStage.trim().length > 0) {
-    return fallbackStage.trim();
-  }
-
-  return null;
-}
-
-function resolveDetail(fallbackErrorMessage, progressDoc, statusDoc) {
-  const fromProgress = progressDoc?.detail;
-  if (typeof fromProgress === "string" && fromProgress.trim().length > 0) {
-    return fromProgress.trim();
-  }
-
-  const fromStatus = statusDoc?.detail;
-  if (typeof fromStatus === "string" && fromStatus.trim().length > 0) {
-    return fromStatus.trim();
-  }
-
-  const fromErrorSummary = statusDoc?.errorSummary;
-  if (typeof fromErrorSummary === "string" && fromErrorSummary.trim().length > 0) {
-    return fromErrorSummary.trim();
-  }
-
-  if (
-    typeof fallbackErrorMessage === "string" &&
-    fallbackErrorMessage.trim().length > 0
-  ) {
-    return fallbackErrorMessage.trim();
-  }
-
-  return null;
-}
-
-function resolveMetrics(progressDoc, statusDoc) {
-  if (isPlainObject(progressDoc?.metrics)) {
-    return progressDoc.metrics;
-  }
-
-  if (isPlainObject(statusDoc?.metrics)) {
-    return statusDoc.metrics;
-  }
-
-  return {};
-}
-
-function resolveStatus(dbStatus, progressDoc, statusDoc) {
-  return (
-    normalizeApiStatus(statusDoc?.status) ??
-    normalizeApiStatus(progressDoc?.status) ??
-    mapJobStatus(dbStatus)
-  );
-}
-
-function resolveProgress(dbProgressPercent, resolvedStatus, progressDoc) {
-  const progressFromDoc = Number(progressDoc?.progress);
-  if (Number.isFinite(progressFromDoc)) {
-    return clamp(progressFromDoc, 0, 1);
-  }
-
-  const fromDb = clamp(Number(dbProgressPercent ?? 0) / 100, 0, 1);
-  if (TERMINAL_STATUSES.has(resolvedStatus)) {
-    return 1;
-  }
-
-  return fromDb;
-}
-
-function pickSceneResultKey(scene) {
-  const candidates = [scene.gaussianSplatKey, scene.meshKey, scene.sfmResultKey];
-  for (const key of candidates) {
-    if (typeof key === "string" && key.trim().length > 0) {
-      return key.trim();
-    }
-  }
-  return null;
-}
-
-function buildPublicS3Url(bucketName, key) {
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
-  const normalizedKey = key.replace(/^\/+/, "");
-  const encodedKey = normalizedKey
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-
-  if (region) {
-    return `https://${bucketName}.s3.${region}.amazonaws.com/${encodedKey}`;
-  }
-
-  return `https://${bucketName}.s3.amazonaws.com/${encodedKey}`;
-}
-
-function getMetaKeys(sceneId, jobId) {
-  const sceneIdText = sceneId.toString();
-  const jobIdText = jobId.toString();
-
-  return {
-    progressKey: `scenes/${sceneIdText}/meta/${jobIdText}/progress.json`,
-    statusKey: `scenes/${sceneIdText}/meta/${jobIdText}/status.json`,
-    resultKey: `scenes/${sceneIdText}/gs/${jobIdText}/result.ply`
-  };
-}
-
-function buildFileInfo(headResult) {
-  if (!headResult) {
-    return null;
-  }
-
-  const etag =
-    typeof headResult.ETag === "string"
-      ? headResult.ETag.replaceAll('"', "")
-      : null;
-
-  return {
-    contentLength:
-      typeof headResult.ContentLength === "number"
-        ? headResult.ContentLength
-        : null,
-    etag,
-    acceptRanges: String(headResult.AcceptRanges ?? "").toLowerCase() === "bytes"
-  };
-}
-
 function truncateErrorMessage(error) {
   const message =
     typeof error?.message === "string" && error.message.trim().length > 0
       ? error.message.trim()
       : "처리 실패";
+
   return message.slice(0, 255);
-}
-
-async function headObjectIfExists(bucketName, key) {
-  try {
-    return await s3.send(
-      new HeadObjectCommand({
-        Bucket: bucketName,
-        Key: key
-      })
-    );
-  } catch (err) {
-    const statusCode = err?.$metadata?.httpStatusCode;
-    const errorName = err?.name;
-    if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-      return null;
-    }
-    throw err;
-  }
-}
-
-async function readJsonObjectFromS3(bucketName, key) {
-  try {
-    const result = await s3.send(
-      new GetObjectCommand({
-        Bucket: bucketName,
-        Key: key
-      })
-    );
-
-    if (!result.Body) {
-      return null;
-    }
-
-    const raw = await streamToString(result.Body);
-    if (typeof raw !== "string" || raw.trim().length === 0) {
-      return null;
-    }
-
-    const parsed = JSON.parse(raw);
-    if (!isPlainObject(parsed)) {
-      return null;
-    }
-
-    return parsed;
-  } catch (err) {
-    const statusCode = err?.$metadata?.httpStatusCode;
-    const errorName = err?.name;
-    if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-      return null;
-    }
-    throw err;
-  }
-}
-
-async function loadJobMetaFromS3(bucketName, sceneId, jobId) {
-  const keys = getMetaKeys(sceneId, jobId);
-  if (!bucketName) {
-    return {
-      keys,
-      progressDoc: null,
-      statusDoc: null
-    };
-  }
-
-  const [progressDoc, statusDoc] = await Promise.all([
-    readJsonObjectFromS3(bucketName, keys.progressKey),
-    readJsonObjectFromS3(bucketName, keys.statusKey)
-  ]);
-
-  return {
-    keys,
-    progressDoc,
-    statusDoc
-  };
 }
 
 async function submitBatchJobToAws({
@@ -507,6 +263,7 @@ async function submitBatchJobToAws({
 
   const command = new SubmitJobCommand(submitInput);
   const response = await batchClient.send(command);
+
   if (typeof response?.jobId !== "string" || response.jobId.trim().length === 0) {
     throw new Error("AWS Batch jobId를 받지 못했습니다.");
   }
@@ -522,12 +279,14 @@ async function loadOwnedScene(sceneId, userId) {
     select: {
       id: true,
       userId: true,
+      title: true,
       status: true,
       uploadId: true,
       inputVideoKey: true,
       gaussianSplatKey: true,
       meshKey: true,
-      sfmResultKey: true
+      sfmResultKey: true,
+      thumbnailKey: true
     }
   });
 
@@ -565,17 +324,50 @@ async function loadOwnedJob(sceneId, jobId) {
       id: jobId,
       sceneId
     },
-    select: {
-      id: true,
-      sceneId: true,
-      status: true,
-      stage: true,
-      progressPercent: true,
-      errorMessage: true,
-      batchJobId: true,
-      updatedAt: true
-    }
+    select: jobBaseSelect
   });
+}
+
+async function serializeJob(job, readModel) {
+  const postId = job.post ? toResponseId(job.post.id) : null;
+  const thumbnail = await buildThumbnailSummary({
+    bucketName: process.env.S3_BUCKET_NAME,
+    post: job.post,
+    job,
+    scene: job.scene
+  });
+
+  return {
+    id: toResponseId(job.id),
+    sceneId: toResponseId(job.sceneId),
+    pipeline: job.pipeline,
+    status: readModel.status,
+    stage: readModel.stage,
+    progress: readModel.progress,
+    imageCount: job.imageCount,
+    overlap: job.overlap,
+    iteration: job.iteration,
+    createdAt: job.createdAt.toISOString(),
+    updatedAt: readModel.updatedAt,
+    finishedAt: readModel.finishedAt,
+    errorMessage: readModel.status === "failed" ? readModel.detail : null,
+    viewerReady: readModel.viewerReady,
+    postable: readModel.postable,
+    alreadyPosted: postId !== null,
+    postId,
+    resultKey: readModel.outputs.resultKey,
+    resultUrl: readModel.outputs.resultUrl,
+    gaussianSplatKey: readModel.outputs.gaussianSplatKey,
+    gaussianSplatUrl: readModel.outputs.gaussianSplatUrl,
+    meshKey: readModel.outputs.meshKey,
+    meshUrl: readModel.outputs.meshUrl,
+    sfmResultKey: readModel.outputs.sfmResultKey,
+    sfmResultUrl: readModel.outputs.sfmResultUrl,
+    thumbnailKey: thumbnail.thumbnailKey,
+    thumbnailUrl: thumbnail.thumbnailUrl,
+    thumbnailUpdatedAt: thumbnail.thumbnailUpdatedAt,
+    outputs: readModel.outputs
+  };
 }
 
 /**
@@ -658,6 +450,7 @@ export async function listSceneJobs(req, res) {
 
     const where = {
       sceneId,
+      pipeline,
       ...(cursor
         ? {
             OR: [
@@ -694,18 +487,14 @@ export async function listSceneJobs(req, res) {
         }
       ],
       take: limit + 1,
-      select: {
-        id: true,
-        status: true,
-        createdAt: true,
-        endedAt: true,
-        errorMessage: true
-      }
+      select: jobBaseSelect
     });
 
     const hasNext = foundJobs.length > limit;
     const jobs = hasNext ? foundJobs.slice(0, limit) : foundJobs;
-    const sceneHasResult = pickSceneResultKey(loadedScene.scene) !== null;
+    const readModels = await Promise.all(
+      jobs.map((job) => buildJobReadModel(job, { bucketName: process.env.S3_BUCKET_NAME }))
+    );
 
     const nextCursor =
       hasNext && jobs.length > 0
@@ -715,18 +504,9 @@ export async function listSceneJobs(req, res) {
     return res.status(200).json({
       sceneId: toResponseId(loadedScene.scene.id),
       inputVideoKey: loadedScene.scene.inputVideoKey ?? null,
-      jobs: jobs.map((job) => {
-        const status = mapJobStatus(job.status);
-        return {
-          id: toResponseId(job.id),
-          pipeline,
-          status,
-          createdAt: job.createdAt.toISOString(),
-          finishedAt: job.endedAt ? job.endedAt.toISOString() : null,
-          errorMessage: job.errorMessage,
-          resultExists: status === READY_STATUS && sceneHasResult
-        };
-      }),
+      jobs: await Promise.all(
+        jobs.map((job, index) => serializeJob(job, readModels[index]))
+      ),
       nextCursor
     });
   } catch (err) {
@@ -801,7 +581,7 @@ export async function createSceneJob(req, res) {
     }
 
     const scene = loadedScene.scene;
-    if (!scene.uploadId || !scene.inputVideoKey || scene.status === "UPLOADING") {
+    if (!scene.uploadId || !scene.inputVideoKey) {
       return sendApiError(
         res,
         req,
@@ -815,6 +595,10 @@ export async function createSceneJob(req, res) {
       data: {
         sceneId,
         uploadId: scene.uploadId,
+        pipeline,
+        imageCount,
+        overlap,
+        iteration,
         status: "QUEUED",
         stage: "INSTANCE_CREATING",
         progressPercent: 0
@@ -870,7 +654,11 @@ export async function createSceneJob(req, res) {
     return res.status(201).json({
       jobId: toResponseId(updated.id),
       sceneId: toResponseId(scene.id),
-      status: mapJobStatus(updated.status),
+      pipeline,
+      imageCount,
+      overlap,
+      iteration,
+      status: "queued",
       batchJobId: awsBatchJobId,
       progressKey: keys.progressKey,
       statusKey: keys.statusKey
@@ -938,29 +726,24 @@ export async function getSceneJobProgress(req, res) {
       );
     }
 
-    const bucketName = process.env.S3_BUCKET_NAME;
-    const { progressDoc, statusDoc } = await loadJobMetaFromS3(
-      bucketName,
-      sceneId,
-      jobId
-    );
-
-    const status = resolveStatus(job.status, progressDoc, statusDoc);
-    const stage = resolveStage(job.stage, progressDoc, statusDoc);
-    const progress = resolveProgress(job.progressPercent, status, progressDoc);
-    const detail = resolveDetail(job.errorMessage, progressDoc, statusDoc);
-    const updatedAt = resolveUpdatedAt(job.updatedAt, progressDoc, statusDoc);
-    const metrics = resolveMetrics(progressDoc, statusDoc);
+    const readModel = await buildJobReadModel(job, {
+      bucketName: process.env.S3_BUCKET_NAME
+    });
+    const postId = job.post ? toResponseId(job.post.id) : null;
 
     return res.status(200).json({
       jobId: toResponseId(job.id),
       sceneId: toResponseId(job.sceneId),
-      status,
-      stage,
-      progress,
-      detail,
-      updatedAt,
-      metrics
+      status: readModel.status,
+      stage: readModel.stage,
+      progress: readModel.progress,
+      detail: readModel.detail,
+      updatedAt: readModel.updatedAt,
+      metrics: readModel.metrics,
+      viewerReady: readModel.viewerReady,
+      postable: readModel.postable,
+      alreadyPosted: postId !== null,
+      postId
     });
   } catch (err) {
     console.error(err);
@@ -1025,42 +808,24 @@ export async function getSceneJobStatus(req, res) {
       );
     }
 
-    const bucketName = process.env.S3_BUCKET_NAME;
-    const { keys, progressDoc, statusDoc } = await loadJobMetaFromS3(
-      bucketName,
-      sceneId,
-      jobId
-    );
-
-    const status = resolveStatus(job.status, progressDoc, statusDoc);
-    const updatedAt = resolveUpdatedAt(job.updatedAt, progressDoc, statusDoc);
-    const errorSummary = resolveDetail(job.errorMessage, progressDoc, statusDoc);
-
-    let outputs = null;
-    if (isPlainObject(statusDoc?.outputs)) {
-      outputs = statusDoc.outputs;
-    }
-
-    if (status === READY_STATUS) {
-      const resultKeyFromStatus =
-        typeof statusDoc?.resultKey === "string" && statusDoc.resultKey.trim().length > 0
-          ? statusDoc.resultKey.trim()
-          : keys.resultKey;
-
-      outputs = {
-        ...(outputs ?? {}),
-        resultKey: resultKeyFromStatus,
-        resultUrl: bucketName ? buildPublicS3Url(bucketName, resultKeyFromStatus) : null
-      };
-    }
+    const readModel = await buildJobReadModel(job, {
+      bucketName: process.env.S3_BUCKET_NAME
+    });
+    const postId = job.post ? toResponseId(job.post.id) : null;
 
     return res.status(200).json({
       jobId: toResponseId(job.id),
       sceneId: toResponseId(job.sceneId),
-      status,
-      outputs,
-      errorSummary: status === "failed" ? errorSummary : null,
-      updatedAt
+      pipeline: job.pipeline,
+      status: readModel.status,
+      outputs: readModel.outputs,
+      viewerReady: readModel.viewerReady,
+      postable: readModel.postable,
+      alreadyPosted: postId !== null,
+      postId,
+      errorSummary: readModel.status === "failed" ? readModel.detail : null,
+      updatedAt: readModel.updatedAt,
+      finishedAt: readModel.finishedAt
     });
   } catch (err) {
     console.error(err);
@@ -1081,16 +846,6 @@ export async function getSceneJobStatus(req, res) {
 export async function getJobViewer(req, res) {
   try {
     const userId = parseBigInt(req.user?.id);
-    if (userId === null) {
-      return sendApiError(
-        res,
-        req,
-        401,
-        "UNAUTHORIZED",
-        "세션 사용자 정보가 유효하지 않습니다."
-      );
-    }
-
     const jobId = parseBigInt(req.params?.jobId);
     if (jobId === null) {
       return sendApiError(
@@ -1106,21 +861,7 @@ export async function getJobViewer(req, res) {
       where: {
         id: jobId
       },
-      select: {
-        id: true,
-        sceneId: true,
-        status: true,
-        updatedAt: true,
-        scene: {
-          select: {
-            id: true,
-            userId: true,
-            gaussianSplatKey: true,
-            meshKey: true,
-            sfmResultKey: true
-          }
-        }
-      }
+      select: jobBaseSelect
     });
 
     if (!job) {
@@ -1133,7 +874,9 @@ export async function getJobViewer(req, res) {
       );
     }
 
-    if (job.scene.userId !== userId) {
+    const isOwner = userId !== null && job.scene.userId === userId;
+    const isPublishedPost = job.post?.status === "PUBLISHED";
+    if (!isOwner && !isPublishedPost) {
       return sendApiError(
         res,
         req,
@@ -1143,68 +886,34 @@ export async function getJobViewer(req, res) {
       );
     }
 
-    const bucketName = process.env.S3_BUCKET_NAME;
-    const { keys, progressDoc, statusDoc } = await loadJobMetaFromS3(
-      bucketName,
-      job.sceneId,
-      job.id
-    );
+    const readModel = await buildJobReadModel(job, {
+      bucketName: process.env.S3_BUCKET_NAME
+    });
+    const postId = job.post ? toResponseId(job.post.id) : null;
+    const thumbnail = await buildThumbnailSummary({
+      bucketName: process.env.S3_BUCKET_NAME,
+      post: job.post,
+      job,
+      scene: job.scene
+    });
 
-    const status = resolveStatus(job.status, progressDoc, statusDoc);
-    const response = {
+    return res.status(200).json({
       jobId: toResponseId(job.id),
       sceneId: toResponseId(job.sceneId),
-      pipeline: DEFAULT_PIPELINE,
-      status,
+      pipeline: job.pipeline,
+      status: readModel.status,
+      viewerReady: readModel.viewerReady,
+      postable: readModel.postable,
+      isOwner,
+      alreadyPosted: postId !== null,
+      postId,
+      thumbnailUrl: thumbnail.thumbnailUrl,
+      thumbnailUpdatedAt: thumbnail.thumbnailUpdatedAt,
       format: VIEWER_FORMAT,
-      resultUrl: null,
-      file: null,
-      updatedAt: resolveUpdatedAt(job.updatedAt, progressDoc, statusDoc)
-    };
-
-    if (status !== READY_STATUS) {
-      return res.status(200).json(response);
-    }
-
-    if (!bucketName) {
-      return sendApiError(
-        res,
-        req,
-        500,
-        "INTERNAL_ERROR",
-        "S3 버킷 설정이 없습니다."
-      );
-    }
-
-    const resultCandidates = [];
-    const resultKeyFromStatus =
-      typeof statusDoc?.resultKey === "string" && statusDoc.resultKey.trim().length > 0
-        ? statusDoc.resultKey.trim()
-        : null;
-    if (resultKeyFromStatus) {
-      resultCandidates.push(resultKeyFromStatus);
-    }
-    resultCandidates.push(keys.resultKey);
-
-    const fallbackSceneKey = pickSceneResultKey(job.scene);
-    if (fallbackSceneKey) {
-      resultCandidates.push(fallbackSceneKey);
-    }
-
-    for (const candidate of resultCandidates) {
-      const headResult = await headObjectIfExists(bucketName, candidate);
-      if (!headResult) {
-        continue;
-      }
-
-      return res.status(200).json({
-        ...response,
-        resultUrl: buildPublicS3Url(bucketName, candidate),
-        file: buildFileInfo(headResult)
-      });
-    }
-
-    return res.status(200).json(response);
+      resultUrl: readModel.resultUrl,
+      file: readModel.file,
+      updatedAt: readModel.updatedAt
+    });
   } catch (err) {
     console.error(err);
     return sendApiError(

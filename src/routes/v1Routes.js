@@ -6,6 +6,15 @@ import {
   getSceneJobStatus,
   listSceneJobs
 } from "../controllers/jobController.js";
+import {
+  completePostThumbnailUpload,
+  createPost,
+  getPostById,
+  getPostViewer,
+  issuePostThumbnailUploadPresign,
+  listPosts
+} from "../controllers/postController.js";
+import { listMyPosts } from "../controllers/userController.js";
 import { listMyScenes } from "../controllers/videoController.js";
 import { sessionAuthV1Middleware } from "../middlewares/sessionAuthMiddleware.js";
 
@@ -15,6 +24,12 @@ router.get(
   "/users/me/scenes",
   sessionAuthV1Middleware,
   listMyScenes
+);
+
+router.get(
+  "/users/me/posts",
+  sessionAuthV1Middleware,
+  listMyPosts
 );
 
 router.get(
@@ -43,8 +58,40 @@ router.get(
 
 router.get(
   "/jobs/:jobId/viewer",
-  sessionAuthV1Middleware,
   getJobViewer
+);
+
+router.post(
+  "/posts",
+  sessionAuthV1Middleware,
+  createPost
+);
+
+router.post(
+  "/posts/:postId/thumbnail/presign",
+  sessionAuthV1Middleware,
+  issuePostThumbnailUploadPresign
+);
+
+router.post(
+  "/posts/:postId/thumbnail/complete",
+  sessionAuthV1Middleware,
+  completePostThumbnailUpload
+);
+
+router.get(
+  "/posts",
+  listPosts
+);
+
+router.get(
+  "/posts/:postId",
+  getPostById
+);
+
+router.get(
+  "/posts/:postId/viewer",
+  getPostViewer
 );
 
 export default router;

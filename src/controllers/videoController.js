@@ -245,20 +245,15 @@ export async function completeVideoUpload(req, res) {
       }
     }
 
-    if (scene.status === "UPLOADED" && scene.inputVideoKey === normalizedKey) {
+    if (scene.inputVideoKey === normalizedKey) {
       return res.status(200).json({
         ok: true,
         sceneId: scene.id.toString(),
-        status: scene.status,
         inputVideoKey: scene.inputVideoKey
       });
     }
 
-    if (
-      scene.status === "UPLOADED" &&
-      scene.inputVideoKey &&
-      scene.inputVideoKey !== normalizedKey
-    ) {
+    if (scene.inputVideoKey && scene.inputVideoKey !== normalizedKey) {
       return res.status(409).json({
         ok: false,
         message: "이미 다른 영상 key가 저장되어 있습니다."
@@ -303,7 +298,6 @@ export async function completeVideoUpload(req, res) {
     return res.status(200).json({
       ok: true,
       sceneId: updated.id.toString(),
-      status: updated.status,
       inputVideoKey: updated.inputVideoKey
     });
   } catch (err) {
@@ -358,16 +352,10 @@ export async function listMyScenes(req, res) {
         select: {
           id: true,
           title: true,
-          status: true,
           uploadId: true,
           inputVideoKey: true,
-          sfmResultKey: true,
-          gaussianSplatKey: true,
-          meshKey: true,
-          thumbnailKey: true,
           createdAt: true,
-          updatedAt: true,
-          finishedAt: true
+          updatedAt: true
         }
       })
     ]);

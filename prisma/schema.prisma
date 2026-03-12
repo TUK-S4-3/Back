@@ -73,6 +73,8 @@ model users {
   providerId      String     @db.VarChar(128) @map("provider_id")
   nickname        String?    @db.VarChar(50)
   profileImageUrl String?    @db.VarChar(255) @map("profile_image_url")
+  profileImageKey String?    @db.VarChar(1024) @map("profile_image_key")
+  profileImageUpdatedAt DateTime? @map("profile_image_updated_at")
   status          UserStatus @default(ACTIVE)
 
   createdAt       DateTime   @default(now()) @map("created_at")
@@ -94,21 +96,20 @@ model scenes {
   title           String      @default("Untitled Scene") @db.VarChar(100)
   status          SceneStatus @default(DRAFT)
   uploadId        String?     @db.Char(36) @map("upload_id")
+  inputVideoKey   String?     @db.VarChar(1024) @map("input_video_key")
 
-  inputVideoKey     String?   @db.VarChar(1024) @map("input_video_key")
-  sfmResultKey      String?   @db.VarChar(1024) @map("sfm_result_key")
-  gaussianSplatKey  String?   @db.VarChar(1024) @map("gaussian_splat_key")
-  meshKey           String?   @db.VarChar(1024) @map("mesh_key")
-  thumbnailKey      String?   @db.VarChar(1024) @map("thumbnail_key")
+  sfmResultKey    String?     @db.VarChar(1024) @map("sfm_result_key")
+  gaussianSplatKey String?    @db.VarChar(1024) @map("gaussian_splat_key")
+  meshKey         String?     @db.VarChar(1024) @map("mesh_key")
+  thumbnailKey    String?     @db.VarChar(1024) @map("thumbnail_key")
 
   createdAt       DateTime    @default(now()) @map("created_at")
   updatedAt       DateTime    @updatedAt @map("updated_at")
   finishedAt      DateTime?   @map("finished_at")
 
   // Relations
-  user            users       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  jobs            jobs[]
-  posts           posts[]
+  user          users     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs          jobs[]
 
   @@index([userId, createdAt], map: "idx_scenes_user_created")
   @@index([status], map: "idx_scenes_status")
@@ -117,42 +118,52 @@ model scenes {
 }
 
 model jobs {
-  id              BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
-  sceneId         BigInt    @db.UnsignedBigInt @map("scene_id")
+  id               BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
+  sceneId          BigInt    @db.UnsignedBigInt @map("scene_id")
 
-  batchJobId      String?   @db.VarChar(128) @map("batch_job_id")
-  uploadId        String?   @db.Char(36) @map("upload_id")
+  batchJobId       String?   @db.VarChar(128) @map("batch_job_id")
+  uploadId         String?   @db.Char(36) @map("upload_id")
+  pipeline         String    @default("3dgs") @db.VarChar(50)
+  imageCount       Int       @default(0) @db.UnsignedInt @map("image_count")
+  overlap          Int       @default(0) @db.UnsignedInt
+  iteration        Int       @default(0) @db.UnsignedInt
+  sfmResultKey     String?   @db.VarChar(1024) @map("sfm_result_key")
+  gaussianSplatKey String?   @db.VarChar(1024) @map("gaussian_splat_key")
+  meshKey          String?   @db.VarChar(1024) @map("mesh_key")
+  thumbnailKey     String?   @db.VarChar(1024) @map("thumbnail_key")
 
-  status          JobStatus @default(QUEUED)
-  stage           JobStage  @default(INSTANCE_CREATING)
+  status           JobStatus @default(QUEUED)
+  stage            JobStage  @default(INSTANCE_CREATING)
 
-  progressPercent Int       @default(0) @db.UnsignedTinyInt @map("progress_percent")
-  cancelRequested Boolean   @default(false) @map("cancel_requested")
+  progressPercent  Int       @default(0) @db.UnsignedTinyInt @map("progress_percent")
+  cancelRequested  Boolean   @default(false) @map("cancel_requested")
 
-  attempt         Int       @default(0) @db.UnsignedInt
-  errorCode       String?   @db.VarChar(50) @map("error_code")
-  errorMessage    String?   @db.VarChar(255) @map("error_message")
+  attempt          Int       @default(0) @db.UnsignedInt
+  errorCode        String?   @db.VarChar(50) @map("error_code")
+  errorMessage     String?   @db.VarChar(255) @map("error_message")
 
-  createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime  @updatedAt @map("updated_at")
-  startedAt       DateTime? @map("started_at")
-  endedAt         DateTime? @map("ended_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  startedAt        DateTime? @map("started_at")
+  endedAt          DateTime? @map("ended_at")
 
   // Relations
-  scene           scenes    @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  scene            scenes    @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  post             posts?
 
   @@unique([batchJobId], map: "uk_batch_job_id")
   @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
   @@index([status, createdAt], map: "idx_jobs_status_created")
   @@index([stage], map: "idx_jobs_stage")
   @@index([uploadId], map: "idx_jobs_upload_id")
+  @@index([pipeline], map: "idx_jobs_pipeline")
   @@map("jobs")
 }
 
 model posts {
   id            BigInt     @id @default(autoincrement()) @db.UnsignedBigInt
   userId        BigInt     @db.UnsignedBigInt @map("user_id")
-  sceneId       BigInt     @db.UnsignedBigInt @map("scene_id")
+  jobId         BigInt     @db.UnsignedBigInt @map("job_id")
 
   title         String     @db.VarChar(100)
   status        PostStatus @default(PUBLISHED)
@@ -161,18 +172,20 @@ model posts {
   downloadCount Int        @default(0) @db.UnsignedInt @map("download_count")
 
   shareUuid     String     @db.Char(36) @map("share_uuid")
+  thumbnailKey  String?    @db.VarChar(1024) @map("thumbnail_key")
+  thumbnailUpdatedAt DateTime? @map("thumbnail_updated_at")
 
   createdAt     DateTime   @default(now()) @map("created_at")
   updatedAt     DateTime   @updatedAt @map("updated_at")
 
   // Relations
   user          users      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  scene         scenes     @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  job           jobs       @relation(fields: [jobId], references: [id], onDelete: Cascade)
   likes         likes[]
 
   @@unique([shareUuid], map: "uk_posts_share_uuid")
+  @@unique([jobId], map: "uk_posts_job_id")
   @@index([userId, createdAt], map: "idx_posts_user_created")
-  @@index([sceneId], map: "idx_posts_scene")
   @@index([createdAt], map: "idx_posts_created")
   @@index([likeCount, createdAt], map: "idx_posts_like")
   @@index([downloadCount, createdAt], map: "idx_posts_download")

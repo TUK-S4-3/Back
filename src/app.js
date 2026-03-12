@@ -2,6 +2,7 @@ import express from 'express';
 import dotenv from "dotenv"
 import cors from 'cors';
 import oauthRouter from "./routes/oauthRouter.js";
+import userRoutes from "./routes/userRoutes.js";
 import videoRoutes from "./routes/videoRoutes.js";
 import v1Routes from "./routes/v1Routes.js";
 import { PrismaSessionStore } from "@quixo3/prisma-session-store";
@@ -10,6 +11,7 @@ import passport from "passport";
 import { googleStrategy } from "./auth.config.js";
 import { prisma } from "./db.config.js";
 import { traceIdMiddleware } from "./middlewares/traceIdMiddleware.js";
+import { buildUserProfileImageSummary } from "./utils/userPresentation.js";
 
 dotenv.config();
 
@@ -90,33 +92,68 @@ app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-function formatSessionUser(user) {
-  if (!user?.id) {
+function parseBigInt(value) {
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function toResponseId(value) {
+  const numeric = Number(value);
+  if (Number.isSafeInteger(numeric)) {
+    return numeric;
+  }
+
+  return value.toString();
+}
+
+async function buildAuthResponseUserById(userId) {
+  const user = await prisma.users.findUnique({
+    where: {
+      id: userId
+    },
+    select: {
+      id: true,
+      provider: true,
+      nickname: true,
+      profileImageUrl: true,
+      profileImageKey: true,
+      profileImageUpdatedAt: true
+    }
+  });
+
+  if (!user) {
     return null;
   }
 
-  const rawId = String(user.id);
-  let id = rawId;
-  try {
-    const parsed = BigInt(rawId);
-    if (parsed <= BigInt(Number.MAX_SAFE_INTEGER)) {
-      id = Number(parsed);
-    }
-  } catch {
-    id = rawId;
-  }
+  const profileImage = await buildUserProfileImageSummary(user, {
+    bucketName: process.env.S3_BUCKET_NAME
+  });
 
   return {
-    id,
-    name: user.name ?? null,
-    email: user.email ?? null,
-    provider: typeof user.provider === "string" ? user.provider.toLowerCase() : "google",
+    id: toResponseId(user.id),
+    name: user.nickname ?? null,
+    nickname: user.nickname ?? null,
+    email: null,
+    provider: String(user.provider).toLowerCase(),
+    profileImageUrl: profileImage.profileImageUrl,
+    profileImageUpdatedAt: profileImage.profileImageUpdatedAt
   };
 }
 
-function getAuthSessionStatus(req, res) {
-  const user = formatSessionUser(req.user);
-  const authenticated = Boolean(req.isAuthenticated?.() && user?.id);
+async function getAuthSessionStatus(req, res) {
+  const sessionUserId = parseBigInt(req.user?.id);
+  if (!req.isAuthenticated?.() || sessionUserId === null) {
+    return res.status(200).json({
+      authenticated: false,
+      user: null,
+    });
+  }
+
+  const user = await buildAuthResponseUserById(sessionUserId);
+  const authenticated = Boolean(user?.id);
 
   return res.status(200).json({
     authenticated,
@@ -200,11 +237,21 @@ app.post("/api/auth/dev/login", async (req, res) => {
         });
       }
 
-      return res.status(200).json({
-        ok: true,
-        message: "로컬 세션 로그인 성공",
-        user: formatSessionUser(sessionUser),
-      });
+      return buildAuthResponseUserById(user.id)
+        .then((authUser) =>
+          res.status(200).json({
+            ok: true,
+            message: "로컬 세션 로그인 성공",
+            user: authUser,
+          })
+        )
+        .catch((authErr) => {
+          console.error(authErr);
+          return res.status(500).json({
+            ok: false,
+            message: "로컬 세션 로그인 실패",
+          });
+        });
     });
   } catch (err) {
     console.error(err);
@@ -250,6 +297,7 @@ app.post("/api/auth/logout", (req, res) => {
 });
 
 app.use("/api/oauth2", oauthRouter)
+app.use("/api/users", userRoutes)
 app.use("/api/videos", videoRoutes);
 app.use("/api/v1", v1Routes);
 

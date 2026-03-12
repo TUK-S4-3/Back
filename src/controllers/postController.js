@@ -608,6 +608,79 @@ export async function getPostViewer(req, res) {
 }
 
 /**
+ * 게시물 삭제
+ * DELETE /api/v1/posts/:postId
+ */
+export async function deletePost(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(
+        res,
+        req,
+        401,
+        "UNAUTHORIZED",
+        "세션 사용자 정보가 유효하지 않습니다."
+      );
+    }
+
+    const postId = parseBigInt(req.params?.postId);
+    if (postId === null) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "postId는 숫자여야 합니다."
+      );
+    }
+
+    const loadedPost = await loadOwnedPublishedPost(postId, userId);
+    if (loadedPost.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedPost.error.status,
+        loadedPost.error.code,
+        loadedPost.error.message
+      );
+    }
+
+    const post = loadedPost.post;
+    await prisma.posts.delete({
+      where: {
+        id: post.id
+      }
+    });
+
+    return res.status(200).json({
+      ok: true,
+      postId: toResponseId(post.id),
+      message: "게시물이 삭제되었습니다."
+    });
+  } catch (err) {
+    if (err?.code === "P2025") {
+      return sendApiError(
+        res,
+        req,
+        404,
+        "POST_NOT_FOUND",
+        "게시물을 찾을 수 없습니다."
+      );
+    }
+
+    console.error(err);
+    return sendApiError(
+      res,
+      req,
+      500,
+      "INTERNAL_ERROR",
+      "게시물 삭제 실패"
+    );
+  }
+}
+
+/**
  * 게시물 썸네일 업로드용 Presigned URL 발급
  * POST /api/v1/posts/:postId/thumbnail/presign
  */

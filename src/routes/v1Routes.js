@@ -9,6 +9,7 @@ import {
 import {
   completePostThumbnailUpload,
   createPost,
+  deletePost,
   getPostById,
   getPostViewer,
   issuePostThumbnailUploadPresign,
@@ -87,6 +88,12 @@ router.get(
 router.get(
   "/posts/:postId",
   getPostById
+);
+
+router.delete(
+  "/posts/:postId",
+  sessionAuthV1Middleware,
+  deletePost
 );
 
 router.get(

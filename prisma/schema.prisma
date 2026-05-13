@@ -52,10 +52,24 @@ enum JobStatus {
 enum JobStage {
   INSTANCE_CREATING
   IMAGESET_BUILDING
+  SFM_FEATURE
+  SFM_MATCH
+  SFM_MAPPER
   SFM
+  UNDISTORT
   GS_TRAINING
   MESH_EXTRACTION
   FINALIZING
+  UPLOADING
+  DONE
+}
+
+enum KeyframeSetStatus {
+  PENDING
+  RUNNING
+  READY
+  FAILED
+  ARCHIVED
 }
 
 enum PostStatus {
@@ -93,6 +107,7 @@ model users {
 model scenes {
   id              BigInt      @id @default(autoincrement()) @db.UnsignedBigInt
   userId          BigInt      @db.UnsignedBigInt @map("user_id")
+  activeKeyframeSetId BigInt? @db.UnsignedBigInt @map("active_keyframe_set_id")
   title           String      @default("Untitled Scene") @db.VarChar(100)
   status          SceneStatus @default(DRAFT)
   uploadId        String?     @db.Char(36) @map("upload_id")
@@ -108,18 +123,23 @@ model scenes {
   finishedAt      DateTime?   @map("finished_at")
 
   // Relations
-  user          users     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  jobs          jobs[]
+  user              users            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobs              jobs[]
+  keyframeSets      keyframe_sets[]  @relation("SceneKeyframeSets")
+  activeKeyframeSet keyframe_sets?   @relation("SceneActiveKeyframeSet", fields: [activeKeyframeSetId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt], map: "idx_scenes_user_created")
   @@index([status], map: "idx_scenes_status")
   @@index([uploadId], map: "idx_scenes_upload_id")
+  @@index([activeKeyframeSetId], map: "idx_scenes_active_keyframe_set_id")
   @@map("scenes")
 }
 
 model jobs {
   id               BigInt    @id @default(autoincrement()) @db.UnsignedBigInt
   sceneId          BigInt    @db.UnsignedBigInt @map("scene_id")
+  keyframeSetId    BigInt?   @db.UnsignedBigInt @map("keyframe_set_id")
+  sourceJobId      BigInt?   @db.UnsignedBigInt @map("source_job_id")
 
   batchJobId       String?   @db.VarChar(128) @map("batch_job_id")
   uploadId         String?   @db.Char(36) @map("upload_id")
@@ -148,16 +168,51 @@ model jobs {
   endedAt          DateTime? @map("ended_at")
 
   // Relations
-  scene            scenes    @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  scene            scenes          @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  keyframeSet      keyframe_sets?  @relation(fields: [keyframeSetId], references: [id], onDelete: SetNull)
   post             posts?
 
   @@unique([batchJobId], map: "uk_batch_job_id")
   @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
+  @@index([keyframeSetId], map: "idx_jobs_keyframe_set_id")
+  @@index([sourceJobId], map: "idx_jobs_source_job_id")
   @@index([status, createdAt], map: "idx_jobs_status_created")
   @@index([stage], map: "idx_jobs_stage")
   @@index([uploadId], map: "idx_jobs_upload_id")
   @@index([pipeline], map: "idx_jobs_pipeline")
   @@map("jobs")
+}
+
+model keyframe_sets {
+  id                    BigInt            @id @default(autoincrement()) @db.UnsignedBigInt
+  sceneId               BigInt            @db.UnsignedBigInt @map("scene_id")
+  version               Int               @db.UnsignedInt
+  status                KeyframeSetStatus @default(PENDING)
+
+  storagePrefix         String            @db.VarChar(1024) @map("storage_prefix")
+  selectedFramesPrefix  String?           @db.VarChar(1024) @map("selected_frames_prefix")
+  selectedFramesCsvKey  String?           @db.VarChar(1024) @map("selected_frames_csv_key")
+  metricsKey            String?           @db.VarChar(1024) @map("metrics_key")
+  configKey             String?           @db.VarChar(1024) @map("config_key")
+  frameIndexPlotKey     String?           @db.VarChar(1024) @map("frame_index_plot_key")
+  timelineComparisonKey String?           @db.VarChar(1024) @map("timeline_comparison_key")
+
+  selectedFrameCount    Int               @default(0) @db.UnsignedInt @map("selected_frame_count")
+  configHash            String?           @db.VarChar(128) @map("config_hash")
+  configJson            Json?             @map("config_json")
+  errorMessage          String?           @db.VarChar(255) @map("error_message")
+
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+
+  scene                 scenes            @relation("SceneKeyframeSets", fields: [sceneId], references: [id], onDelete: Cascade)
+  activeForScenes       scenes[]          @relation("SceneActiveKeyframeSet")
+  jobs                  jobs[]
+
+  @@unique([sceneId, version], map: "uk_keyframe_sets_scene_version")
+  @@index([sceneId, status, createdAt], map: "idx_keyframe_sets_scene_status_created")
+  @@index([status], map: "idx_keyframe_sets_status")
+  @@map("keyframe_sets")
 }
 
 model posts {

@@ -1,9 +1,12 @@
 import express from "express";
 import {
+  activateSceneKeyframeSet,
+  createSceneKeyframeSet,
   createSceneJob,
   getJobViewer,
   getSceneJobProgress,
   getSceneJobStatus,
+  listSceneKeyframeSets,
   listSceneJobs
 } from "../controllers/jobController.js";
 import {
@@ -38,6 +41,24 @@ router.get(
   "/scenes/:sceneId/jobs",
   sessionAuthV1Middleware,
   listSceneJobs
+);
+
+router.get(
+  "/scenes/:sceneId/keyframe-sets",
+  sessionAuthV1Middleware,
+  listSceneKeyframeSets
+);
+
+router.post(
+  "/scenes/:sceneId/keyframe-sets",
+  sessionAuthV1Middleware,
+  createSceneKeyframeSet
+);
+
+router.patch(
+  "/scenes/:sceneId/keyframe-sets/:keyframeSetId/active",
+  sessionAuthV1Middleware,
+  activateSceneKeyframeSet
 );
 
 router.post(

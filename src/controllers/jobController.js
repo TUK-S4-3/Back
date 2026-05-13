@@ -8,17 +8,28 @@ import {
   getMetaKeys,
   VIEWER_FORMAT
 } from "../utils/jobPresentation.js";
-import { getLocalStorageRoot, isLocalStorage } from "../utils/storage.js";
+import {
+  buildPublicStorageUrl,
+  getLocalStorageRoot,
+  isLocalStorage,
+  readJsonStorageObject
+} from "../utils/storage.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 const DEFAULT_AUTOMATED_IMAGE_COUNT = 0;
 const DEFAULT_AUTOMATED_OVERLAP = 0;
 const DEFAULT_AUTOMATED_ITERATION = 30000;
+const KEYFRAME_PIPELINE = "keyframes";
+const SFM_PIPELINE = "sfm";
+const GS_PIPELINE = "gs";
+const SUPPORTED_PIPELINES = new Set([DEFAULT_PIPELINE, KEYFRAME_PIPELINE, SFM_PIPELINE, GS_PIPELINE]);
 
 const jobBaseSelect = {
   id: true,
   sceneId: true,
+  keyframeSetId: true,
+  sourceJobId: true,
   status: true,
   stage: true,
   progressPercent: true,
@@ -36,6 +47,25 @@ const jobBaseSelect = {
   gaussianSplatKey: true,
   meshKey: true,
   thumbnailKey: true,
+  keyframeSet: {
+    select: {
+      id: true,
+      sceneId: true,
+      version: true,
+      status: true,
+      storagePrefix: true,
+      selectedFramesPrefix: true,
+      selectedFramesCsvKey: true,
+      metricsKey: true,
+      configKey: true,
+      frameIndexPlotKey: true,
+      timelineComparisonKey: true,
+      selectedFrameCount: true,
+      errorMessage: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  },
   post: {
     select: {
       id: true,
@@ -53,9 +83,30 @@ const jobBaseSelect = {
       gaussianSplatKey: true,
       meshKey: true,
       sfmResultKey: true,
-      thumbnailKey: true
+      thumbnailKey: true,
+      activeKeyframeSetId: true
     }
   }
+};
+
+const keyframeSetSelect = {
+  id: true,
+  sceneId: true,
+  version: true,
+  status: true,
+  storagePrefix: true,
+  selectedFramesPrefix: true,
+  selectedFramesCsvKey: true,
+  metricsKey: true,
+  configKey: true,
+  frameIndexPlotKey: true,
+  timelineComparisonKey: true,
+  selectedFrameCount: true,
+  configHash: true,
+  configJson: true,
+  errorMessage: true,
+  createdAt: true,
+  updatedAt: true
 };
 
 function parseBigInt(value) {
@@ -94,7 +145,7 @@ function parsePipeline(value) {
   }
 
   const normalized = String(value).trim().toLowerCase();
-  if (normalized !== DEFAULT_PIPELINE) {
+  if (!SUPPORTED_PIPELINES.has(normalized)) {
     return null;
   }
 
@@ -139,6 +190,70 @@ function toResponseId(value) {
   }
 
   return value.toString();
+}
+
+function buildKeyframeSetPrefix(sceneId, version) {
+  return `scenes/${sceneId.toString()}/keyframes/v${version}`;
+}
+
+function buildKeyframeSetKeys(storagePrefix) {
+  const prefix = String(storagePrefix).replace(/\/+$/, "");
+  return {
+    storagePrefix: prefix,
+    selectedFramesPrefix: `${prefix}/selected_frames`,
+    selectedFramesCsvKey: `${prefix}/selected_frames.csv`,
+    metricsKey: `${prefix}/selection_metrics.json`,
+    configKey: `${prefix}/config.yaml`,
+    frameIndexPlotKey: `${prefix}/frame_index_comparison.png`,
+    timelineComparisonKey: `${prefix}/timeline_comparison.mp4`,
+    statusKey: `${prefix}/status.json`
+  };
+}
+
+function serializeKeyframeSet(keyframeSet, activeKeyframeSetId = null) {
+  if (!keyframeSet) {
+    return null;
+  }
+
+  const keys = buildKeyframeSetKeys(keyframeSet.storagePrefix);
+  const bucketName = process.env.S3_BUCKET_NAME;
+  const active =
+    activeKeyframeSetId !== null &&
+    keyframeSet.id?.toString() === activeKeyframeSetId.toString();
+
+  return {
+    id: toResponseId(keyframeSet.id),
+    sceneId: toResponseId(keyframeSet.sceneId),
+    version: keyframeSet.version,
+    status: String(keyframeSet.status ?? "").toLowerCase(),
+    active,
+    storagePrefix: keyframeSet.storagePrefix,
+    selectedFramesPrefix: keyframeSet.selectedFramesPrefix ?? keys.selectedFramesPrefix,
+    selectedFramesCsvKey: keyframeSet.selectedFramesCsvKey ?? keys.selectedFramesCsvKey,
+    metricsKey: keyframeSet.metricsKey ?? keys.metricsKey,
+    configKey: keyframeSet.configKey ?? keys.configKey,
+    frameIndexPlotKey: keyframeSet.frameIndexPlotKey ?? keys.frameIndexPlotKey,
+    frameIndexPlotUrl: buildPublicStorageUrl(bucketName, keyframeSet.frameIndexPlotKey ?? keys.frameIndexPlotKey),
+    timelineComparisonKey: keyframeSet.timelineComparisonKey ?? keys.timelineComparisonKey,
+    timelineComparisonUrl: buildPublicStorageUrl(bucketName, keyframeSet.timelineComparisonKey ?? keys.timelineComparisonKey),
+    selectedFrameCount: keyframeSet.selectedFrameCount ?? 0,
+    configHash: keyframeSet.configHash ?? null,
+    configJson: keyframeSet.configJson ?? null,
+    errorMessage: keyframeSet.errorMessage ?? null,
+    createdAt: keyframeSet.createdAt?.toISOString?.() ?? null,
+    updatedAt: keyframeSet.updatedAt?.toISOString?.() ?? null
+  };
+}
+
+function pipelineToStage(pipeline) {
+  if (pipeline === KEYFRAME_PIPELINE) return "keyframes";
+  if (pipeline === SFM_PIPELINE) return "sfm";
+  if (pipeline === GS_PIPELINE) return "gs";
+  return "full";
+}
+
+function buildSfmPrefix(sceneId, jobId) {
+  return `scenes/${sceneId.toString()}/sfm/${jobId.toString()}`;
 }
 
 function truncateErrorMessage(error) {
@@ -206,7 +321,11 @@ async function submitJobToLocalDocker({
   uploadId,
   jobId,
   pipeline,
-  inputVideoKey
+  inputVideoKey,
+  keyframeSetId,
+  keyframesPrefix,
+  pipelineStage,
+  sourceSfmPrefix
 }) {
   if (!isLocalStorage()) {
     throw new Error("로컬 Docker 실행은 STORAGE_DRIVER=local 설정이 필요합니다.");
@@ -238,6 +357,10 @@ async function submitJobToLocalDocker({
   appendDockerEnv(args, "UPLOAD_ID", uploadId);
   appendDockerEnv(args, "INPUT_VIDEO_KEY", inputVideoKey);
   appendDockerEnv(args, "PIPELINE", pipeline);
+  appendDockerEnv(args, "PIPELINE_STAGE", pipelineStage ?? pipelineToStage(pipeline));
+  appendDockerEnv(args, "KEYFRAME_SET_ID", keyframeSetId?.toString?.() ?? keyframeSetId);
+  appendDockerEnv(args, "KEYFRAMES_PREFIX", keyframesPrefix);
+  appendDockerEnv(args, "SOURCE_SFM_PREFIX", sourceSfmPrefix);
   appendOptionalPipelineEnv(args);
   args.push(image);
 
@@ -280,7 +403,11 @@ async function submitBatchJobToAws({
   overlap,
   iteration,
   pipeline,
-  bucketName
+  bucketName,
+  keyframeSetId,
+  keyframesPrefix,
+  pipelineStage,
+  sourceSfmPrefix
 }) {
   const jobQueue = process.env.BATCH_JOB_QUEUE;
   const jobDefinition = process.env.BATCH_JOB_DEFINITION;
@@ -354,6 +481,30 @@ async function submitBatchJobToAws({
       value: pipeline
     }
   ];
+  if (pipelineStage) {
+    environmentOverrides.push({
+      name: "PIPELINE_STAGE",
+      value: pipelineStage
+    });
+  }
+  if (keyframeSetId) {
+    environmentOverrides.push({
+      name: "KEYFRAME_SET_ID",
+      value: keyframeSetId.toString()
+    });
+  }
+  if (keyframesPrefix) {
+    environmentOverrides.push({
+      name: "KEYFRAMES_PREFIX",
+      value: keyframesPrefix
+    });
+  }
+  if (sourceSfmPrefix) {
+    environmentOverrides.push({
+      name: "SOURCE_SFM_PREFIX",
+      value: sourceSfmPrefix
+    });
+  }
 
   const submitInput = {
     jobName,
@@ -389,6 +540,167 @@ async function submitBatchJobToAws({
   return response.jobId.trim();
 }
 
+async function refreshKeyframeSetFromStorage(keyframeSet) {
+  if (!keyframeSet?.storagePrefix) {
+    return keyframeSet;
+  }
+
+  const keys = buildKeyframeSetKeys(keyframeSet.storagePrefix);
+  const [statusDoc, metricsDoc] = await Promise.all([
+    readJsonStorageObject(process.env.S3_BUCKET_NAME, keys.statusKey),
+    readJsonStorageObject(process.env.S3_BUCKET_NAME, keys.metricsKey)
+  ]);
+
+  const data = {};
+  const rawStatus = String(statusDoc?.status ?? "").trim().toUpperCase();
+  if (rawStatus === "SUCCEEDED" && keyframeSet.status !== "READY") {
+    data.status = "READY";
+  } else if (rawStatus === "FAILED" && keyframeSet.status !== "FAILED") {
+    data.status = "FAILED";
+  }
+
+  const selectedFrameCount = Number.parseInt(
+    String(
+      statusDoc?.selectedFrameCount ??
+        metricsDoc?.actual_selected_num_frames ??
+        metricsDoc?.selected_num_frames ??
+        ""
+    ),
+    10
+  );
+  if (
+    Number.isFinite(selectedFrameCount) &&
+    selectedFrameCount >= 0 &&
+    selectedFrameCount !== keyframeSet.selectedFrameCount
+  ) {
+    data.selectedFrameCount = selectedFrameCount;
+  }
+
+  const errorMessage =
+    typeof statusDoc?.errorMessage === "string" && statusDoc.errorMessage.trim().length > 0
+      ? statusDoc.errorMessage.trim().slice(0, 255)
+      : null;
+  if (errorMessage && errorMessage !== keyframeSet.errorMessage) {
+    data.errorMessage = errorMessage;
+  }
+
+  if (Object.keys(data).length === 0) {
+    return keyframeSet;
+  }
+
+  return prisma.keyframe_sets.update({
+    where: {
+      id: keyframeSet.id
+    },
+    data,
+    select: keyframeSetSelect
+  });
+}
+
+async function createKeyframeSetRecord(sceneId) {
+  const aggregate = await prisma.keyframe_sets.aggregate({
+    where: {
+      sceneId
+    },
+    _max: {
+      version: true
+    }
+  });
+  const version = Number(aggregate._max.version ?? 0) + 1;
+  const storagePrefix = buildKeyframeSetPrefix(sceneId, version);
+  const keys = buildKeyframeSetKeys(storagePrefix);
+
+  return prisma.keyframe_sets.create({
+    data: {
+      sceneId,
+      version,
+      status: "PENDING",
+      storagePrefix,
+      selectedFramesPrefix: keys.selectedFramesPrefix,
+      selectedFramesCsvKey: keys.selectedFramesCsvKey,
+      metricsKey: keys.metricsKey,
+      configKey: keys.configKey,
+      frameIndexPlotKey: keys.frameIndexPlotKey,
+      timelineComparisonKey: keys.timelineComparisonKey
+    },
+    select: keyframeSetSelect
+  });
+}
+
+async function resolveJobKeyframeSet({ scene, requestedKeyframeSetId, createIfMissing }) {
+  if (requestedKeyframeSetId) {
+    const keyframeSet = await prisma.keyframe_sets.findFirst({
+      where: {
+        id: requestedKeyframeSetId,
+        sceneId: scene.id
+      },
+      select: keyframeSetSelect
+    });
+    if (!keyframeSet) {
+      return {
+        keyframeSet: null,
+        error: {
+          status: 404,
+          code: "KEYFRAME_SET_NOT_FOUND",
+          message: "선택한 KS 버전을 찾을 수 없습니다."
+        }
+      };
+    }
+
+    const refreshed = await refreshKeyframeSetFromStorage(keyframeSet);
+    if (refreshed.status !== "READY") {
+      return {
+        keyframeSet: null,
+        error: {
+          status: 409,
+          code: "KEYFRAME_SET_NOT_READY",
+          message: "READY 상태의 KS 버전만 사용할 수 있습니다."
+        }
+      };
+    }
+
+    return {
+      keyframeSet: refreshed,
+      created: false,
+      error: null
+    };
+  }
+
+  if (scene.activeKeyframeSetId) {
+    const active = await prisma.keyframe_sets.findFirst({
+      where: {
+        id: scene.activeKeyframeSetId,
+        sceneId: scene.id
+      },
+      select: keyframeSetSelect
+    });
+    if (active) {
+      const refreshed = await refreshKeyframeSetFromStorage(active);
+      if (refreshed.status === "READY") {
+        return {
+          keyframeSet: refreshed,
+          created: false,
+          error: null
+        };
+      }
+    }
+  }
+
+  if (!createIfMissing) {
+    return {
+      keyframeSet: null,
+      created: false,
+      error: null
+    };
+  }
+
+  return {
+    keyframeSet: await createKeyframeSetRecord(scene.id),
+    created: true,
+    error: null
+  };
+}
+
 async function loadOwnedScene(sceneId, userId) {
   const scene = await prisma.scenes.findUnique({
     where: {
@@ -401,6 +713,7 @@ async function loadOwnedScene(sceneId, userId) {
       status: true,
       uploadId: true,
       inputVideoKey: true,
+      activeKeyframeSetId: true,
       gaussianSplatKey: true,
       meshKey: true,
       sfmResultKey: true,
@@ -459,6 +772,9 @@ async function serializeJob(job, readModel) {
     id: toResponseId(job.id),
     sceneId: toResponseId(job.sceneId),
     pipeline: job.pipeline,
+    keyframeSetId: job.keyframeSetId ? toResponseId(job.keyframeSetId) : null,
+    sourceJobId: job.sourceJobId ? toResponseId(job.sourceJobId) : null,
+    keyframeSet: serializeKeyframeSet(job.keyframeSet, job.scene?.activeKeyframeSetId ?? null),
     status: readModel.status,
     stage: readModel.stage,
     progress: readModel.progress,
@@ -527,14 +843,14 @@ export async function listSceneJobs(req, res) {
       );
     }
 
-    const pipeline = parsePipeline(req.query?.pipeline);
+    const pipeline = req.query?.pipeline === undefined ? undefined : parsePipeline(req.query?.pipeline);
     if (pipeline === null) {
       return sendApiError(
         res,
         req,
         400,
         "BAD_REQUEST",
-        "pipeline은 3dgs만 지원합니다."
+        "pipeline 값을 확인해주세요."
       );
     }
 
@@ -568,7 +884,7 @@ export async function listSceneJobs(req, res) {
 
     const where = {
       sceneId,
-      pipeline,
+      ...(pipeline ? { pipeline } : {}),
       ...(cursor
         ? {
             OR: [
@@ -639,6 +955,265 @@ export async function listSceneJobs(req, res) {
   }
 }
 
+export async function listSceneKeyframeSets(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    if (sceneId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const keyframeSets = await prisma.keyframe_sets.findMany({
+      where: {
+        sceneId
+      },
+      orderBy: {
+        version: "desc"
+      },
+      select: keyframeSetSelect
+    });
+    const refreshed = await Promise.all(
+      keyframeSets.map((keyframeSet) => refreshKeyframeSetFromStorage(keyframeSet))
+    );
+    let activeKeyframeSetId = loadedScene.scene.activeKeyframeSetId;
+    if (!activeKeyframeSetId) {
+      const latestReady = refreshed.find((keyframeSet) => keyframeSet.status === "READY");
+      if (latestReady) {
+        await prisma.scenes.update({
+          where: {
+            id: sceneId
+          },
+          data: {
+            activeKeyframeSetId: latestReady.id
+          }
+        });
+        activeKeyframeSetId = latestReady.id;
+      }
+    }
+
+    return res.status(200).json({
+      sceneId: toResponseId(sceneId),
+      activeKeyframeSetId: activeKeyframeSetId
+        ? toResponseId(activeKeyframeSetId)
+        : null,
+      keyframeSets: refreshed.map((keyframeSet) =>
+        serializeKeyframeSet(keyframeSet, activeKeyframeSetId)
+      )
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS 버전 목록 조회 실패");
+  }
+}
+
+export async function createSceneKeyframeSet(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    if (sceneId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const scene = loadedScene.scene;
+    if (!scene.uploadId || !scene.inputVideoKey) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "업로드 완료된 scene만 KS 생성이 가능합니다.");
+    }
+
+    const keyframeSet = await createKeyframeSetRecord(sceneId);
+    const job = await prisma.jobs.create({
+      data: {
+        sceneId,
+        keyframeSetId: keyframeSet.id,
+        uploadId: scene.uploadId,
+        pipeline: KEYFRAME_PIPELINE,
+        imageCount: DEFAULT_AUTOMATED_IMAGE_COUNT,
+        overlap: DEFAULT_AUTOMATED_OVERLAP,
+        iteration: 0,
+        status: "QUEUED",
+        stage: "IMAGESET_BUILDING",
+        progressPercent: 0
+      }
+    });
+
+    let submittedJobId = null;
+    const runner = getPipelineRunner();
+    const keys = buildKeyframeSetKeys(keyframeSet.storagePrefix);
+    try {
+      submittedJobId =
+        runner === "aws"
+          ? await submitBatchJobToAws({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: job.id,
+              imageCount: 0,
+              overlap: 0,
+              iteration: 0,
+              pipeline: KEYFRAME_PIPELINE,
+              bucketName: process.env.S3_BUCKET_NAME,
+              keyframeSetId: keyframeSet.id,
+              keyframesPrefix: keyframeSet.storagePrefix,
+              pipelineStage: "keyframes"
+            })
+          : await submitJobToLocalDocker({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: job.id,
+              pipeline: KEYFRAME_PIPELINE,
+              inputVideoKey: scene.inputVideoKey,
+              keyframeSetId: keyframeSet.id,
+              keyframesPrefix: keyframeSet.storagePrefix,
+              pipelineStage: "keyframes"
+            });
+    } catch (submitErr) {
+      await prisma.$transaction([
+        prisma.jobs.update({
+          where: {
+            id: job.id
+          },
+          data: {
+            status: "FAILED",
+            errorMessage: truncateErrorMessage(submitErr),
+            endedAt: new Date()
+          }
+        }),
+        prisma.keyframe_sets.update({
+          where: {
+            id: keyframeSet.id
+          },
+          data: {
+            status: "FAILED",
+            errorMessage: truncateErrorMessage(submitErr)
+          }
+        })
+      ]);
+      console.error(submitErr);
+      return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS 생성 작업 제출 실패");
+    }
+
+    const [updatedJob, updatedKeyframeSet] = await prisma.$transaction([
+      prisma.jobs.update({
+        where: {
+          id: job.id
+        },
+        data: {
+          batchJobId: submittedJobId,
+          status: "SUBMITTED"
+        }
+      }),
+      prisma.keyframe_sets.update({
+        where: {
+          id: keyframeSet.id
+        },
+        data: {
+          status: "RUNNING"
+        },
+        select: keyframeSetSelect
+      })
+    ]);
+
+    return res.status(202).json({
+      keyframeSet: serializeKeyframeSet(updatedKeyframeSet, scene.activeKeyframeSetId),
+      jobId: toResponseId(updatedJob.id),
+      batchJobId: submittedJobId,
+      runner,
+      statusKey: keys.statusKey
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS 생성 실패");
+  }
+}
+
+export async function activateSceneKeyframeSet(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    const keyframeSetId = parseBigInt(req.params?.keyframeSetId);
+    if (sceneId === null || keyframeSetId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId와 keyframeSetId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const keyframeSet = await prisma.keyframe_sets.findFirst({
+      where: {
+        id: keyframeSetId,
+        sceneId
+      },
+      select: keyframeSetSelect
+    });
+    if (!keyframeSet) {
+      return sendApiError(res, req, 404, "KEYFRAME_SET_NOT_FOUND", "KS 버전을 찾을 수 없습니다.");
+    }
+
+    const refreshed = await refreshKeyframeSetFromStorage(keyframeSet);
+    if (refreshed.status !== "READY") {
+      return sendApiError(res, req, 409, "KEYFRAME_SET_NOT_READY", "READY 상태의 KS 버전만 active로 지정할 수 있습니다.");
+    }
+
+    await prisma.scenes.update({
+      where: {
+        id: sceneId
+      },
+      data: {
+        activeKeyframeSetId: keyframeSetId
+      }
+    });
+
+    return res.status(200).json({
+      sceneId: toResponseId(sceneId),
+      activeKeyframeSetId: toResponseId(keyframeSetId),
+      keyframeSet: serializeKeyframeSet(refreshed, keyframeSetId)
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "active KS 버전 변경 실패");
+  }
+}
+
 /**
  * Scene별 Job 생성 + 파이프라인 제출
  * POST /api/v1/scenes/:sceneId/jobs
@@ -668,6 +1243,20 @@ export async function createSceneJob(req, res) {
     }
 
     const pipeline = parsePipeline(req.body?.pipeline);
+    const requestedKeyframeSetIdRaw = req.body?.keyframeSetId;
+    const requestedKeyframeSetId =
+      requestedKeyframeSetIdRaw === undefined ||
+      requestedKeyframeSetIdRaw === null ||
+      String(requestedKeyframeSetIdRaw).trim().length === 0
+        ? null
+        : parseBigInt(requestedKeyframeSetIdRaw);
+    const requestedSourceJobIdRaw = req.body?.sourceJobId;
+    const requestedSourceJobId =
+      requestedSourceJobIdRaw === undefined ||
+      requestedSourceJobIdRaw === null ||
+      String(requestedSourceJobIdRaw).trim().length === 0
+        ? null
+        : parseBigInt(requestedSourceJobIdRaw);
     const imageCount = DEFAULT_AUTOMATED_IMAGE_COUNT;
     const overlap = DEFAULT_AUTOMATED_OVERLAP;
     const iteration = parsePositiveInt(process.env.KEYFRAME_GS_ITERS) ?? DEFAULT_AUTOMATED_ITERATION;
@@ -679,6 +1268,34 @@ export async function createSceneJob(req, res) {
         400,
         "BAD_REQUEST",
         "pipeline(3dgs) 값을 확인해주세요."
+      );
+    }
+    if (
+      requestedKeyframeSetIdRaw !== undefined &&
+      requestedKeyframeSetIdRaw !== null &&
+      String(requestedKeyframeSetIdRaw).trim().length > 0 &&
+      requestedKeyframeSetId === null
+    ) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "keyframeSetId는 숫자여야 합니다."
+      );
+    }
+    if (
+      requestedSourceJobIdRaw !== undefined &&
+      requestedSourceJobIdRaw !== null &&
+      String(requestedSourceJobIdRaw).trim().length > 0 &&
+      requestedSourceJobId === null
+    ) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "sourceJobId는 숫자여야 합니다."
       );
     }
 
@@ -704,9 +1321,74 @@ export async function createSceneJob(req, res) {
       );
     }
 
+    let sourceJob = null;
+    let sourceSfmPrefix = null;
+    if (pipeline === GS_PIPELINE) {
+      if (!requestedSourceJobId) {
+        return sendApiError(
+          res,
+          req,
+          400,
+          "BAD_REQUEST",
+          "GS job 생성에는 sourceJobId가 필요합니다."
+        );
+      }
+      sourceJob = await loadOwnedJob(sceneId, requestedSourceJobId);
+      if (!sourceJob) {
+        return sendApiError(
+          res,
+          req,
+          404,
+          "SOURCE_JOB_NOT_FOUND",
+          "원본 SfM job을 찾을 수 없습니다."
+        );
+      }
+      const sourceReadModel = await buildJobReadModel(sourceJob, {
+        bucketName: process.env.S3_BUCKET_NAME
+      });
+      if (sourceReadModel.status !== "ready" || !sourceReadModel.outputs.sfmResultKey) {
+        return sendApiError(
+          res,
+          req,
+          409,
+          "SOURCE_SFM_NOT_READY",
+          "READY 상태의 SfM job만 GS 입력으로 사용할 수 있습니다."
+        );
+      }
+      sourceSfmPrefix = buildSfmPrefix(sceneId, sourceJob.id);
+    }
+
+    const resolvedKeyframeSet = await resolveJobKeyframeSet({
+      scene,
+      requestedKeyframeSetId,
+      createIfMissing: pipeline !== GS_PIPELINE
+    });
+    if (resolvedKeyframeSet.error) {
+      return sendApiError(
+        res,
+        req,
+        resolvedKeyframeSet.error.status,
+        resolvedKeyframeSet.error.code,
+        resolvedKeyframeSet.error.message
+      );
+    }
+    if (!resolvedKeyframeSet.keyframeSet && pipeline !== GS_PIPELINE) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "KEYFRAME_SET_REQUIRED",
+        "사용 가능한 KS 버전이 없습니다."
+      );
+    }
+
+    const jobKeyframeSet = resolvedKeyframeSet.keyframeSet ?? sourceJob?.keyframeSet ?? null;
+
     const created = await prisma.jobs.create({
       data: {
         sceneId,
+        keyframeSetId: jobKeyframeSet?.id ?? null,
+        sourceJobId: sourceJob?.id ?? null,
         uploadId: scene.uploadId,
         pipeline,
         imageCount,
@@ -731,26 +1413,50 @@ export async function createSceneJob(req, res) {
               overlap,
               iteration,
               pipeline,
-              bucketName: process.env.S3_BUCKET_NAME
+              bucketName: process.env.S3_BUCKET_NAME,
+              keyframeSetId: jobKeyframeSet?.id ?? null,
+              keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
+              pipelineStage: pipelineToStage(pipeline),
+              sourceSfmPrefix
             })
           : await submitJobToLocalDocker({
               sceneId,
               uploadId: scene.uploadId,
               jobId: created.id,
               pipeline,
-              inputVideoKey: scene.inputVideoKey
+              inputVideoKey: scene.inputVideoKey,
+              keyframeSetId: jobKeyframeSet?.id ?? null,
+              keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
+              pipelineStage: pipelineToStage(pipeline),
+              sourceSfmPrefix
             });
     } catch (submitErr) {
-      await prisma.jobs.update({
-        where: {
-          id: created.id
-        },
-        data: {
-          status: "FAILED",
-          errorMessage: truncateErrorMessage(submitErr),
-          endedAt: new Date()
-        }
-      });
+      const updates = [
+        prisma.jobs.update({
+          where: {
+            id: created.id
+          },
+          data: {
+            status: "FAILED",
+            errorMessage: truncateErrorMessage(submitErr),
+            endedAt: new Date()
+          }
+        })
+      ];
+      if (resolvedKeyframeSet.created && resolvedKeyframeSet.keyframeSet) {
+        updates.push(
+          prisma.keyframe_sets.update({
+            where: {
+              id: resolvedKeyframeSet.keyframeSet.id
+            },
+            data: {
+              status: "FAILED",
+              errorMessage: truncateErrorMessage(submitErr)
+            }
+          })
+        );
+      }
+      await prisma.$transaction(updates);
 
       console.error(submitErr);
       return sendApiError(
@@ -769,8 +1475,19 @@ export async function createSceneJob(req, res) {
       data: {
         batchJobId: submittedJobId,
         status: "SUBMITTED"
-      }
+      },
+      select: jobBaseSelect
     });
+    if (resolvedKeyframeSet.created && resolvedKeyframeSet.keyframeSet) {
+      await prisma.keyframe_sets.update({
+        where: {
+          id: resolvedKeyframeSet.keyframeSet.id
+        },
+        data: {
+          status: "RUNNING"
+        }
+      });
+    }
 
     const keys = getMetaKeys(sceneId, updated.id);
 
@@ -784,6 +1501,7 @@ export async function createSceneJob(req, res) {
       status: "queued",
       batchJobId: submittedJobId,
       runner,
+      keyframeSet: serializeKeyframeSet(updated.keyframeSet, scene.activeKeyframeSetId),
       progressKey: keys.progressKey,
       statusKey: keys.statusKey
     });

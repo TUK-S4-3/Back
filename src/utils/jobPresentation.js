@@ -1,8 +1,11 @@
-import { GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { prisma } from "../db.config.js";
-import { s3 } from "./s3.js";
-import { streamToString } from "./stream.js";
+import {
+  buildPublicStorageUrl,
+  buildStorageGetUrl,
+  headStorageObject,
+  isLocalStorage,
+  readJsonStorageObject
+} from "./storage.js";
 
 export const DEFAULT_PIPELINE = "3dgs";
 export const READY_STATUS = "ready";
@@ -247,22 +250,7 @@ function resolveUrlVersion(value) {
 }
 
 export function buildPublicS3Url(bucketName, key) {
-  const normalizedKey = normalizeStorageKey(key);
-  if (!bucketName || !normalizedKey) {
-    return null;
-  }
-
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
-  const encodedKey = normalizedKey
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-
-  if (region) {
-    return `https://${bucketName}.s3.${region}.amazonaws.com/${encodedKey}`;
-  }
-
-  return `https://${bucketName}.s3.amazonaws.com/${encodedKey}`;
+  return buildPublicStorageUrl(bucketName, key);
 }
 
 export function buildVersionedPublicS3Url(bucketName, key, updatedAt) {
@@ -290,20 +278,13 @@ function getThumbnailGetExpiresInSeconds() {
 
 export async function buildSignedGetObjectUrl(bucketName, key) {
   const normalizedKey = normalizeStorageKey(key);
-  if (!bucketName || !normalizedKey) {
+  if (!normalizedKey) {
     return null;
   }
 
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({
-      Bucket: bucketName,
-      Key: normalizedKey
-    }),
-    {
-      expiresIn: getThumbnailGetExpiresInSeconds()
-    }
-  );
+  return buildStorageGetUrl(bucketName, normalizedKey, {
+    expiresIn: getThumbnailGetExpiresInSeconds()
+  });
 }
 
 async function buildThumbnailPayload(bucketName, key, updatedAt) {
@@ -378,60 +359,16 @@ function buildFileInfo(headResult) {
 }
 
 async function headObjectIfExists(bucketName, key) {
-  try {
-    return await s3.send(
-      new HeadObjectCommand({
-        Bucket: bucketName,
-        Key: key
-      })
-    );
-  } catch (err) {
-    const statusCode = err?.$metadata?.httpStatusCode;
-    const errorName = err?.name;
-    if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-      return null;
-    }
-    throw err;
-  }
+  return headStorageObject(bucketName, key);
 }
 
 async function readJsonObjectFromS3(bucketName, key) {
-  try {
-    const result = await s3.send(
-      new GetObjectCommand({
-        Bucket: bucketName,
-        Key: key
-      })
-    );
-
-    if (!result.Body) {
-      return null;
-    }
-
-    const raw = await streamToString(result.Body);
-    if (typeof raw !== "string" || raw.trim().length === 0) {
-      return null;
-    }
-
-    const parsed = JSON.parse(raw);
-    if (!isPlainObject(parsed)) {
-      return null;
-    }
-
-    return parsed;
-  } catch (err) {
-    const statusCode = err?.$metadata?.httpStatusCode;
-    const errorName = err?.name;
-    if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-      return null;
-    }
-    throw err;
-  }
+  return readJsonStorageObject(bucketName, key);
 }
 
 export async function loadJobMetaFromS3(bucketName, sceneId, jobId) {
   const keys = getMetaKeys(sceneId, jobId);
-  if (!bucketName) {
+  if (!bucketName && !isLocalStorage()) {
     return {
       keys,
       progressDoc: null,
@@ -521,7 +458,7 @@ function dedupeKeys(values) {
 }
 
 async function findViewerAsset(bucketName, resolvedStatus, outputKeys, sceneFallbackKeys) {
-  if (resolvedStatus !== READY_STATUS || !bucketName) {
+  if (resolvedStatus !== READY_STATUS || (!bucketName && !isLocalStorage())) {
     return null;
   }
 

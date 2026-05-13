@@ -3,7 +3,8 @@ import { sessionAuthMiddleware } from "../middlewares/sessionAuthMiddleware.js";
 import {
   completeVideoUpload,
   issueVideoUploadPresign,
-  listMyScenes
+  listMyScenes,
+  uploadVideoToLocalStorage
 } from "../controllers/videoController.js";
 
 const router = express.Router();
@@ -16,6 +17,16 @@ router.post(
   "/presign",
   sessionAuthMiddleware,
   issueVideoUploadPresign
+);
+
+router.put(
+  "/local-upload",
+  sessionAuthMiddleware,
+  express.raw({
+    type: "video/mp4",
+    limit: process.env.LOCAL_VIDEO_UPLOAD_LIMIT ?? "5gb"
+  }),
+  uploadVideoToLocalStorage
 );
 
 /**

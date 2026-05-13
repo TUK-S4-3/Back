@@ -11,6 +11,7 @@ import passport from "passport";
 import { googleStrategy } from "./auth.config.js";
 import { prisma } from "./db.config.js";
 import { traceIdMiddleware } from "./middlewares/traceIdMiddleware.js";
+import { getLocalStorageRoot, isLocalStorage } from "./utils/storage.js";
 import { buildUserProfileImageSummary } from "./utils/userPresentation.js";
 
 dotenv.config();
@@ -66,6 +67,9 @@ app.use(
   })
 );
 app.use(express.static('public')); 
+if (isLocalStorage()) {
+  app.use("/local-assets", express.static(getLocalStorageRoot()));
+}
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(traceIdMiddleware);

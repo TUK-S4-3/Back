@@ -1,9 +1,14 @@
-import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { prisma } from "../db.config.js";
 import { sendApiError } from "../utils/apiError.js";
 import { buildThumbnailSummary } from "../utils/jobPresentation.js";
-import { s3 } from "../utils/s3.js";
+import {
+  buildStorageUploadUrl,
+  getStorageDriver,
+  headStorageObject,
+  isLocalStorage,
+  normalizeStorageKey as normalizeStoredObjectKey,
+  writeLocalStorageObject
+} from "../utils/storage.js";
 import { buildUserProfileImageSummary } from "../utils/userPresentation.js";
 
 const DEFAULT_PAGE = 1;
@@ -112,11 +117,7 @@ function normalizeNickname(value) {
 }
 
 function normalizeStorageKey(value) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return null;
-  }
-
-  return value.trim();
+  return normalizeStoredObjectKey(value);
 }
 
 function parseProfileImageContentType(value) {
@@ -139,6 +140,11 @@ function buildProfileImageKey(userId, contentType) {
 
 function buildProfileImagePrefix(userId) {
   return `users/${userId}/profile/profile.`;
+}
+
+function buildLocalProfileImageUploadUrl(key) {
+  const params = new URLSearchParams({ key });
+  return `/api/users/me/profile-image/local-upload?${params.toString()}`;
 }
 
 function buildPostViewerApiPath(postId) {
@@ -298,7 +304,7 @@ export async function updateMyProfile(req, res) {
 export async function issueProfileImageUploadPresign(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return sendApiError(
         res,
         req,
@@ -331,17 +337,13 @@ export async function issueProfileImageUploadPresign(req, res) {
     }
 
     const key = buildProfileImageKey(userId.toString(), contentType);
-    const uploadUrl = await getSignedUrl(
-      s3,
-      new PutObjectCommand({
-        Bucket: bucketName,
-        Key: key,
-        ContentType: contentType
-      }),
-      {
-        expiresIn: PROFILE_IMAGE_PRESIGNED_URL_EXPIRES_IN_SECONDS
-      }
-    );
+    const uploadUrl = await buildStorageUploadUrl({
+      bucketName,
+      key,
+      contentType,
+      expiresIn: PROFILE_IMAGE_PRESIGNED_URL_EXPIRES_IN_SECONDS,
+      localUrl: buildLocalProfileImageUploadUrl(key)
+    });
 
     const profileImageUrl = await buildUserProfileImageSummary(
       {
@@ -373,10 +375,99 @@ export async function issueProfileImageUploadPresign(req, res) {
   }
 }
 
+export async function uploadProfileImageToLocalStorage(req, res) {
+  try {
+    if (!isLocalStorage()) {
+      return sendApiError(
+        res,
+        req,
+        404,
+        "NOT_FOUND",
+        "로컬 저장소 모드가 아닙니다."
+      );
+    }
+
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(
+        res,
+        req,
+        401,
+        "UNAUTHORIZED",
+        "세션 사용자 정보가 유효하지 않습니다."
+      );
+    }
+
+    const contentType = parseProfileImageContentType(req.headers["content-type"]);
+    if (contentType === null) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "contentType은 image/jpeg, image/png, image/webp만 허용됩니다."
+      );
+    }
+
+    const key = normalizeStorageKey(req.query?.key);
+    if (!key) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "key는 필수입니다.");
+    }
+
+    const expectedKey = buildProfileImageKey(userId.toString(), contentType);
+    if (key !== expectedKey) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "허용되지 않는 key입니다."
+      );
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "업로드된 프로필 이미지를 찾을 수 없습니다."
+      );
+    }
+
+    if (req.body.length > PROFILE_IMAGE_MAX_BYTES) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "프로필 이미지는 5MB 이하여야 합니다."
+      );
+    }
+
+    await writeLocalStorageObject(key, req.body);
+
+    return res.status(200).json({
+      ok: true,
+      key,
+      size: req.body.length
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(
+      res,
+      req,
+      500,
+      "INTERNAL_ERROR",
+      "로컬 프로필 이미지 업로드 실패"
+    );
+  }
+}
+
 export async function completeProfileImageUpload(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return sendApiError(
         res,
         req,
@@ -419,28 +510,15 @@ export async function completeProfileImageUpload(req, res) {
       );
     }
 
-    let headResult;
-    try {
-      headResult = await s3.send(
-        new HeadObjectCommand({
-          Bucket: bucketName,
-          Key: key
-        })
+    const headResult = await headStorageObject(bucketName, key);
+    if (!headResult) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "업로드된 프로필 이미지를 찾을 수 없습니다."
       );
-    } catch (err) {
-      const statusCode = err?.$metadata?.httpStatusCode;
-      const errorName = err?.name;
-      if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-        return sendApiError(
-          res,
-          req,
-          400,
-          "BAD_REQUEST",
-          "업로드된 프로필 이미지를 찾을 수 없습니다."
-        );
-      }
-
-      throw err;
     }
 
     const contentType = parseProfileImageContentType(headResult.ContentType);

@@ -13,7 +13,8 @@ import {
   getPostById,
   getPostViewer,
   issuePostThumbnailUploadPresign,
-  listPosts
+  listPosts,
+  uploadPostThumbnailToLocalStorage
 } from "../controllers/postController.js";
 import { listMyPosts } from "../controllers/userController.js";
 import { listMyScenes } from "../controllers/videoController.js";
@@ -72,6 +73,16 @@ router.post(
   "/posts/:postId/thumbnail/presign",
   sessionAuthV1Middleware,
   issuePostThumbnailUploadPresign
+);
+
+router.put(
+  "/posts/:postId/thumbnail/local-upload",
+  sessionAuthV1Middleware,
+  express.raw({
+    type: "image/jpeg",
+    limit: process.env.LOCAL_THUMBNAIL_UPLOAD_LIMIT ?? "10mb"
+  }),
+  uploadPostThumbnailToLocalStorage
 );
 
 router.post(

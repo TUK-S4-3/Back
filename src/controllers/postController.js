@@ -1,5 +1,3 @@
-import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuid } from "uuid";
 import { prisma } from "../db.config.js";
 import { sendApiError } from "../utils/apiError.js";
@@ -7,7 +5,14 @@ import {
   buildJobReadModel,
   buildThumbnailSummary
 } from "../utils/jobPresentation.js";
-import { s3 } from "../utils/s3.js";
+import {
+  buildStorageUploadUrl,
+  getStorageDriver,
+  headStorageObject,
+  isLocalStorage,
+  normalizeStorageKey as normalizeStoredObjectKey,
+  writeLocalStorageObject
+} from "../utils/storage.js";
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 20;
@@ -139,15 +144,16 @@ function buildPostViewerApiPath(postId) {
 }
 
 function normalizeStorageKey(value) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    return null;
-  }
-
-  return value.trim();
+  return normalizeStoredObjectKey(value);
 }
 
 function buildPostThumbnailKey(sceneId, jobId) {
   return `scenes/${sceneId}/thumb/${jobId}/thumbnail.jpg`;
+}
+
+function buildLocalPostThumbnailUploadUrl(postId, key) {
+  const params = new URLSearchParams({ key });
+  return `/api/v1/posts/${encodeURIComponent(String(postId))}/thumbnail/local-upload?${params.toString()}`;
 }
 
 async function buildPostThumbnailSummary(post) {
@@ -687,7 +693,7 @@ export async function deletePost(req, res) {
 export async function issuePostThumbnailUploadPresign(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return sendApiError(
         res,
         req,
@@ -742,17 +748,13 @@ export async function issuePostThumbnailUploadPresign(req, res) {
 
     const post = loadedPost.post;
     const key = buildPostThumbnailKey(post.job.sceneId, post.job.id);
-    const uploadUrl = await getSignedUrl(
-      s3,
-      new PutObjectCommand({
-        Bucket: bucketName,
-        Key: key,
-        ContentType: THUMBNAIL_CONTENT_TYPE
-      }),
-      {
-        expiresIn: THUMBNAIL_PRESIGNED_URL_EXPIRES_IN_SECONDS
-      }
-    );
+    const uploadUrl = await buildStorageUploadUrl({
+      bucketName,
+      key,
+      contentType: THUMBNAIL_CONTENT_TYPE,
+      expiresIn: THUMBNAIL_PRESIGNED_URL_EXPIRES_IN_SECONDS,
+      localUrl: buildLocalPostThumbnailUploadUrl(post.id, key)
+    });
 
     return res.status(200).json({
       ok: true,
@@ -782,6 +784,121 @@ export async function issuePostThumbnailUploadPresign(req, res) {
   }
 }
 
+export async function uploadPostThumbnailToLocalStorage(req, res) {
+  try {
+    if (!isLocalStorage()) {
+      return sendApiError(
+        res,
+        req,
+        404,
+        "NOT_FOUND",
+        "로컬 저장소 모드가 아닙니다."
+      );
+    }
+
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(
+        res,
+        req,
+        401,
+        "UNAUTHORIZED",
+        "세션 사용자 정보가 유효하지 않습니다."
+      );
+    }
+
+    const postId = parseBigInt(req.params?.postId);
+    if (postId === null) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "postId는 숫자여야 합니다."
+      );
+    }
+
+    const contentType = String(req.headers["content-type"] ?? "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (contentType !== THUMBNAIL_CONTENT_TYPE) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "contentType은 image/jpeg만 허용됩니다."
+      );
+    }
+
+    const key = normalizeStorageKey(req.query?.key);
+    if (!key) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "key는 필수입니다.");
+    }
+
+    const loadedPost = await loadOwnedPublishedPost(postId, userId);
+    if (loadedPost.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedPost.error.status,
+        loadedPost.error.code,
+        loadedPost.error.message
+      );
+    }
+
+    const post = loadedPost.post;
+    const expectedKey = buildPostThumbnailKey(post.job.sceneId, post.job.id);
+    if (key !== expectedKey) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "허용되지 않는 key입니다."
+      );
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "업로드된 썸네일을 찾을 수 없습니다."
+      );
+    }
+
+    if (req.body.length > THUMBNAIL_MAX_BYTES) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "썸네일은 10MB 이하여야 합니다."
+      );
+    }
+
+    await writeLocalStorageObject(key, req.body);
+
+    return res.status(200).json({
+      ok: true,
+      key,
+      size: req.body.length
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(
+      res,
+      req,
+      500,
+      "INTERNAL_ERROR",
+      "로컬 게시물 썸네일 업로드 실패"
+    );
+  }
+}
+
 /**
  * 게시물 썸네일 업로드 완료 처리
  * POST /api/v1/posts/:postId/thumbnail/complete
@@ -789,7 +906,7 @@ export async function issuePostThumbnailUploadPresign(req, res) {
 export async function completePostThumbnailUpload(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return sendApiError(
         res,
         req,
@@ -855,29 +972,15 @@ export async function completePostThumbnailUpload(req, res) {
       );
     }
 
-    let headResult;
-    try {
-      headResult = await s3.send(
-        new HeadObjectCommand({
-          Bucket: bucketName,
-          Key: key
-        })
+    const headResult = await headStorageObject(bucketName, key);
+    if (!headResult) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "업로드된 썸네일을 찾을 수 없습니다."
       );
-    } catch (err) {
-      const statusCode = err?.$metadata?.httpStatusCode;
-      const errorName = err?.name;
-
-      if (statusCode === 404 || errorName === "NotFound" || errorName === "NoSuchKey") {
-        return sendApiError(
-          res,
-          req,
-          400,
-          "BAD_REQUEST",
-          "업로드된 썸네일을 찾을 수 없습니다."
-        );
-      }
-
-      throw err;
     }
 
     const contentType =

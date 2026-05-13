@@ -1,8 +1,13 @@
-import { HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuid } from "uuid";
 import { prisma } from "../db.config.js";
-import { s3 } from "../utils/s3.js";
+import {
+  buildStorageUploadUrl,
+  getStorageDriver,
+  headStorageObject,
+  isLocalStorage,
+  normalizeStorageKey,
+  writeLocalStorageObject
+} from "../utils/storage.js";
 
 const ALLOWED_VIDEO_CONTENT_TYPES = ["video/mp4"];
 const PRESIGNED_URL_EXPIRES_IN_SECONDS = 60 * 5;
@@ -37,6 +42,19 @@ function buildExpectedVideoInputPrefix(sceneId) {
   return `scenes/${sceneId}/input/video/`;
 }
 
+function buildLocalVideoUploadUrl(sceneId, key) {
+  const params = new URLSearchParams({
+    sceneId: sceneId.toString(),
+    key
+  });
+  return `/api/videos/local-upload?${params.toString()}`;
+}
+
+function isAllowedVideoContentType(value) {
+  const contentType = String(value ?? "").split(";")[0].trim().toLowerCase();
+  return ALLOWED_VIDEO_CONTENT_TYPES.includes(contentType) ? contentType : null;
+}
+
 async function cleanupExpiredUploadingScenes() {
   const ttlMinutes = getUploadingSceneTtlMinutes();
   const cutoff = new Date(Date.now() - ttlMinutes * 60 * 1000);
@@ -59,7 +77,7 @@ async function cleanupExpiredUploadingScenes() {
 export async function issueVideoUploadPresign(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return res.status(500).json({
         ok: false,
         message: "S3 버킷 설정이 없습니다."
@@ -127,14 +145,12 @@ export async function issueVideoUploadPresign(req, res) {
 
     const key = `scenes/${scene.id.toString()}/input/video/${uploadId}.mp4`;
 
-    const command = new PutObjectCommand({
-      Bucket: bucketName,
-      Key: key,
-      ContentType: contentType
-    });
-
-    const url = await getSignedUrl(s3, command, {
-      expiresIn: PRESIGNED_URL_EXPIRES_IN_SECONDS
+    const url = await buildStorageUploadUrl({
+      bucketName,
+      key,
+      contentType,
+      expiresIn: PRESIGNED_URL_EXPIRES_IN_SECONDS,
+      localUrl: buildLocalVideoUploadUrl(scene.id, key)
     });
 
     return res.status(201).json({
@@ -154,6 +170,99 @@ export async function issueVideoUploadPresign(req, res) {
   }
 }
 
+export async function uploadVideoToLocalStorage(req, res) {
+  try {
+    if (!isLocalStorage()) {
+      return res.status(404).json({
+        ok: false,
+        message: "로컬 저장소 모드가 아닙니다."
+      });
+    }
+
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return res.status(401).json({
+        ok: false,
+        message: "세션 사용자 정보가 유효하지 않습니다."
+      });
+    }
+
+    const parsedSceneId = parseBigInt(req.query?.sceneId);
+    if (parsedSceneId === null) {
+      return res.status(400).json({
+        ok: false,
+        message: "sceneId는 필수입니다."
+      });
+    }
+
+    const normalizedKey = normalizeStorageKey(req.query?.key);
+    if (!normalizedKey) {
+      return res.status(400).json({
+        ok: false,
+        message: "key는 필수입니다."
+      });
+    }
+
+    const contentType = isAllowedVideoContentType(req.headers["content-type"]);
+    if (!contentType) {
+      return res.status(400).json({
+        ok: false,
+        message: "지원하지 않는 영상 형식입니다."
+      });
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        message: "업로드된 영상을 찾을 수 없습니다."
+      });
+    }
+
+    const scene = await prisma.scenes.findUnique({
+      where: {
+        id: parsedSceneId
+      }
+    });
+
+    if (!scene) {
+      return res.status(404).json({
+        ok: false,
+        message: "scene을 찾을 수 없습니다."
+      });
+    }
+
+    if (scene.userId !== userId) {
+      return res.status(403).json({
+        ok: false,
+        message: "접근 권한이 없습니다."
+      });
+    }
+
+    const expectedPrefix = buildExpectedVideoInputPrefix(parsedSceneId.toString());
+    const expectedKey = `${expectedPrefix}${scene.uploadId}.mp4`;
+    if (normalizedKey !== expectedKey) {
+      return res.status(400).json({
+        ok: false,
+        message: "scene의 uploadId와 일치하지 않는 key입니다."
+      });
+    }
+
+    await writeLocalStorageObject(normalizedKey, req.body);
+
+    return res.status(200).json({
+      ok: true,
+      key: normalizedKey,
+      size: req.body.length
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      ok: false,
+      message: "로컬 영상 업로드 실패"
+    });
+  }
+}
+
 /**
  * 영상 업로드 완료 신고 + S3 검증
  * POST /api/videos/complete
@@ -161,7 +270,7 @@ export async function issueVideoUploadPresign(req, res) {
 export async function completeVideoUpload(req, res) {
   try {
     const bucketName = process.env.S3_BUCKET_NAME;
-    if (!bucketName) {
+    if (getStorageDriver() === "s3" && !bucketName) {
       return res.status(500).json({
         ok: false,
         message: "S3 버킷 설정이 없습니다."
@@ -199,7 +308,13 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
-    const normalizedKey = key.trim();
+    const normalizedKey = normalizeStorageKey(key);
+    if (!normalizedKey) {
+      return res.status(400).json({
+        ok: false,
+        message: "key는 필수입니다."
+      });
+    }
 
     const scene = await prisma.scenes.findUnique({
       where: {
@@ -260,29 +375,12 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
-    try {
-      await s3.send(
-        new HeadObjectCommand({
-          Bucket: bucketName,
-          Key: normalizedKey
-        })
-      );
-    } catch (headErr) {
-      const statusCode = headErr?.$metadata?.httpStatusCode;
-      const errorName = headErr?.name;
-
-      if (
-        statusCode === 404 ||
-        errorName === "NotFound" ||
-        errorName === "NoSuchKey"
-      ) {
-        return res.status(400).json({
-          ok: false,
-          message: "업로드된 영상을 찾을 수 없습니다."
-        });
-      }
-
-      throw headErr;
+    const headResult = await headStorageObject(bucketName, normalizedKey);
+    if (!headResult) {
+      return res.status(400).json({
+        ok: false,
+        message: "업로드된 영상을 찾을 수 없습니다."
+      });
     }
 
     const updated = await prisma.scenes.update({

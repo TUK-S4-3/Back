@@ -4,7 +4,8 @@ import {
   completeProfileImageUpload,
   getMyProfile,
   issueProfileImageUploadPresign,
-  updateMyProfile
+  updateMyProfile,
+  uploadProfileImageToLocalStorage
 } from "../controllers/userController.js";
 
 const router = express.Router();
@@ -25,6 +26,16 @@ router.post(
   "/me/profile-image/presign",
   sessionAuthV1Middleware,
   issueProfileImageUploadPresign
+);
+
+router.put(
+  "/me/profile-image/local-upload",
+  sessionAuthV1Middleware,
+  express.raw({
+    type: ["image/jpeg", "image/png", "image/webp"],
+    limit: process.env.LOCAL_PROFILE_IMAGE_UPLOAD_LIMIT ?? "5mb"
+  }),
+  uploadProfileImageToLocalStorage
 );
 
 router.post(

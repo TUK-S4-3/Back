@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { prisma } from "../db.config.js";
 import { sendApiError } from "../utils/apiError.js";
 import {
@@ -7,9 +8,13 @@ import {
   getMetaKeys,
   VIEWER_FORMAT
 } from "../utils/jobPresentation.js";
+import { getLocalStorageRoot, isLocalStorage } from "../utils/storage.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
+const DEFAULT_AUTOMATED_IMAGE_COUNT = 0;
+const DEFAULT_AUTOMATED_OVERLAP = 0;
+const DEFAULT_AUTOMATED_ITERATION = 30000;
 
 const jobBaseSelect = {
   id: true,
@@ -83,15 +88,6 @@ function parsePositiveInt(value) {
   return parsed;
 }
 
-function parseNonNegativeInt(value) {
-  const parsed = Number.parseInt(String(value ?? ""), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return null;
-  }
-
-  return parsed;
-}
-
 function parsePipeline(value) {
   if (value === undefined || value === null || String(value).trim().length === 0) {
     return DEFAULT_PIPELINE;
@@ -152,6 +148,128 @@ function truncateErrorMessage(error) {
       : "처리 실패";
 
   return message.slice(0, 255);
+}
+
+function getPipelineRunner() {
+  const runner = String(process.env.PIPELINE_RUNNER ?? "local").trim().toLowerCase();
+  return runner === "aws" ? "aws" : "local";
+}
+
+function sanitizeContainerName(value) {
+  return String(value).replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 128);
+}
+
+function appendDockerEnv(args, name, value) {
+  if (value === undefined || value === null || String(value).trim().length === 0) {
+    return;
+  }
+  args.push("-e", `${name}=${String(value)}`);
+}
+
+function appendOptionalPipelineEnv(args) {
+  const names = [
+    "KEYFRAME_GS_ITERS",
+    "KEYFRAME_CANDIDATE_FPS",
+    "KEYFRAME_MIN_CANDIDATE_FRAMES",
+    "KEYFRAME_MAX_CANDIDATE_FRAMES",
+    "KEYFRAME_FRAME_LIMIT_ENABLED",
+    "KEYFRAME_TARGET_GAP_RATIO",
+    "KEYFRAME_SOFT_CV_TARGET",
+    "KEYFRAME_DENSITY_WEIGHT",
+    "KEYFRAME_CV_WEIGHT",
+    "KEYFRAME_SEARCH_STEP",
+    "KEYFRAME_IMAGE_SIZE",
+    "KEYFRAME_COLOR_MODE",
+    "KEYFRAME_EPOCHS",
+    "KEYFRAME_BATCH_SIZE",
+    "KEYFRAME_LOCAL_REFINE_ITERATIONS",
+    "KEYFRAME_LOCAL_REFINE_WINDOW",
+    "KEYFRAME_DEVICE",
+    "KEYFRAME_PRECLUSTER_ENABLED",
+    "KEYFRAME_PRECLUSTER_GLOBAL_PERCENTILE",
+    "KEYFRAME_PRECLUSTER_LOCAL_WINDOW",
+    "KEYFRAME_PRECLUSTER_LOCAL_MAD_MULTIPLIER",
+    "KEYFRAME_PRECLUSTER_MIN_LOCAL_MEDIAN_RATIO",
+    "KEYFRAME_PRECLUSTER_MIN_LOCAL_THRESHOLD_RATIO",
+    "KEYFRAME_PRECLUSTER_MAX_NEIGHBOR_HIGH_COUNT",
+    "KEYFRAME_PRECLUSTER_MIN_CLUSTER_FRAMES",
+    "KEYFRAME_PRECLUSTER_MIN_FRAMES_PER_CLUSTER"
+  ];
+
+  for (const name of names) {
+    appendDockerEnv(args, name, process.env[name]);
+  }
+}
+
+async function submitJobToLocalDocker({
+  sceneId,
+  uploadId,
+  jobId,
+  pipeline,
+  inputVideoKey
+}) {
+  if (!isLocalStorage()) {
+    throw new Error("로컬 Docker 실행은 STORAGE_DRIVER=local 설정이 필요합니다.");
+  }
+
+  const image = process.env.PIPELINE_DOCKER_IMAGE ?? "pipeline-gs:latest";
+  const dockerBin = process.env.PIPELINE_DOCKER_BIN ?? "docker";
+  const storageRoot = getLocalStorageRoot();
+  const containerPrefix = process.env.PIPELINE_CONTAINER_NAME_PREFIX ?? "scene-job";
+  const containerName = sanitizeContainerName(
+    `${containerPrefix}-${sceneId.toString()}-${jobId.toString()}`
+  );
+  const dockerRm = String(process.env.PIPELINE_DOCKER_RM ?? "true").trim().toLowerCase() !== "false";
+  const gpus = String(process.env.PIPELINE_DOCKER_GPUS ?? "all").trim();
+
+  const args = ["run", "-d"];
+  if (dockerRm) {
+    args.push("--rm");
+  }
+  if (gpus && gpus.toLowerCase() !== "none") {
+    args.push("--gpus", gpus);
+  }
+  args.push("--name", containerName);
+  args.push("-v", `${storageRoot}:/data/storage`);
+  appendDockerEnv(args, "STORAGE_DRIVER", "local");
+  appendDockerEnv(args, "LOCAL_STORAGE_ROOT", "/data/storage");
+  appendDockerEnv(args, "SCENE_ID", sceneId.toString());
+  appendDockerEnv(args, "JOB_ID", jobId.toString());
+  appendDockerEnv(args, "UPLOAD_ID", uploadId);
+  appendDockerEnv(args, "INPUT_VIDEO_KEY", inputVideoKey);
+  appendDockerEnv(args, "PIPELINE", pipeline);
+  appendOptionalPipelineEnv(args);
+  args.push(image);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(dockerBin, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `docker run failed with exit code ${code}`));
+        return;
+      }
+
+      const containerId = stdout.trim();
+      if (!containerId) {
+        reject(new Error("Docker container id를 받지 못했습니다."));
+        return;
+      }
+
+      resolve(containerId);
+    });
+  });
 }
 
 async function submitBatchJobToAws({
@@ -522,7 +640,7 @@ export async function listSceneJobs(req, res) {
 }
 
 /**
- * Scene별 Job 생성 + AWS Batch 제출
+ * Scene별 Job 생성 + 파이프라인 제출
  * POST /api/v1/scenes/:sceneId/jobs
  */
 export async function createSceneJob(req, res) {
@@ -549,23 +667,18 @@ export async function createSceneJob(req, res) {
       );
     }
 
-    const imageCount = parsePositiveInt(req.body?.imageCount);
-    const overlap = parseNonNegativeInt(req.body?.overlap);
-    const iteration = parsePositiveInt(req.body?.iteration);
     const pipeline = parsePipeline(req.body?.pipeline);
+    const imageCount = DEFAULT_AUTOMATED_IMAGE_COUNT;
+    const overlap = DEFAULT_AUTOMATED_OVERLAP;
+    const iteration = parsePositiveInt(process.env.KEYFRAME_GS_ITERS) ?? DEFAULT_AUTOMATED_ITERATION;
 
-    if (
-      imageCount === null ||
-      overlap === null ||
-      iteration === null ||
-      pipeline === null
-    ) {
+    if (pipeline === null) {
       return sendApiError(
         res,
         req,
         400,
         "BAD_REQUEST",
-        "imageCount, overlap, iteration, pipeline(3dgs) 값을 확인해주세요."
+        "pipeline(3dgs) 값을 확인해주세요."
       );
     }
 
@@ -605,18 +718,28 @@ export async function createSceneJob(req, res) {
       }
     });
 
-    let awsBatchJobId = null;
+    let submittedJobId = null;
+    const runner = getPipelineRunner();
     try {
-      awsBatchJobId = await submitBatchJobToAws({
-        sceneId,
-        uploadId: scene.uploadId,
-        jobId: created.id,
-        imageCount,
-        overlap,
-        iteration,
-        pipeline,
-        bucketName: process.env.S3_BUCKET_NAME
-      });
+      submittedJobId =
+        runner === "aws"
+          ? await submitBatchJobToAws({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: created.id,
+              imageCount,
+              overlap,
+              iteration,
+              pipeline,
+              bucketName: process.env.S3_BUCKET_NAME
+            })
+          : await submitJobToLocalDocker({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: created.id,
+              pipeline,
+              inputVideoKey: scene.inputVideoKey
+            });
     } catch (submitErr) {
       await prisma.jobs.update({
         where: {
@@ -635,7 +758,7 @@ export async function createSceneJob(req, res) {
         req,
         500,
         "INTERNAL_ERROR",
-        "AWS Batch 작업 제출 실패"
+        "파이프라인 작업 제출 실패"
       );
     }
 
@@ -644,7 +767,7 @@ export async function createSceneJob(req, res) {
         id: created.id
       },
       data: {
-        batchJobId: awsBatchJobId,
+        batchJobId: submittedJobId,
         status: "SUBMITTED"
       }
     });
@@ -659,7 +782,8 @@ export async function createSceneJob(req, res) {
       overlap,
       iteration,
       status: "queued",
-      batchJobId: awsBatchJobId,
+      batchJobId: submittedJobId,
+      runner,
       progressKey: keys.progressKey,
       statusKey: keys.statusKey
     });

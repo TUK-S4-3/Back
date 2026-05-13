@@ -34,7 +34,8 @@ router.get(
           });
         }
 
-        return res.redirect("/");
+        //return res.redirect("/");
+        return res.redirect(process.env.FRONTEND_URL ?? "http://localhost:5173");
       });
     })(req, res, next);
   }

@@ -44,6 +44,7 @@ enum JobStatus {
   QUEUED
   SUBMITTED
   RUNNING
+  WAITING_GS
   SUCCEEDED
   FAILED
   CANCELLED
@@ -56,6 +57,7 @@ enum JobStage {
   SFM_MATCH
   SFM_MAPPER
   SFM
+  SFM_DONE
   UNDISTORT
   GS_TRAINING
   MESH_EXTRACTION
@@ -142,6 +144,7 @@ model jobs {
   sourceJobId      BigInt?   @db.UnsignedBigInt @map("source_job_id")
 
   batchJobId       String?   @db.VarChar(128) @map("batch_job_id")
+  gsBatchJobId     String?   @db.VarChar(128) @map("gs_batch_job_id")
   uploadId         String?   @db.Char(36) @map("upload_id")
   pipeline         String    @default("3dgs") @db.VarChar(50)
   imageCount       Int       @default(0) @db.UnsignedInt @map("image_count")
@@ -176,6 +179,7 @@ model jobs {
   @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
   @@index([keyframeSetId], map: "idx_jobs_keyframe_set_id")
   @@index([sourceJobId], map: "idx_jobs_source_job_id")
+  @@index([gsBatchJobId], map: "idx_jobs_gs_batch_job_id")
   @@index([status, createdAt], map: "idx_jobs_status_created")
   @@index([stage], map: "idx_jobs_stage")
   @@index([uploadId], map: "idx_jobs_upload_id")

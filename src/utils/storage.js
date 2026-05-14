@@ -51,7 +51,7 @@ export function getLocalStorageRoot() {
   return path.resolve(process.env.LOCAL_STORAGE_ROOT ?? path.join(process.cwd(), "..", "data", "storage"));
 }
 
-function resolveLocalStoragePath(key) {
+export function resolveLocalStoragePath(key) {
   const normalizedKey = normalizeStorageKey(key);
   if (!normalizedKey) {
     return null;

@@ -9,9 +9,11 @@ import {
 
 export const DEFAULT_PIPELINE = "3dgs";
 export const READY_STATUS = "ready";
+export const WAITING_GS_STATUS = "waiting_gs";
 export const VIEWER_FORMAT = "ply";
 
 const TERMINAL_STATUSES = new Set([READY_STATUS, "failed", "canceled"]);
+const VIEWABLE_STATUSES = new Set([READY_STATUS, WAITING_GS_STATUS]);
 const JOB_STAGE_VALUES = new Set([
   "INSTANCE_CREATING",
   "IMAGESET_BUILDING",
@@ -19,6 +21,7 @@ const JOB_STAGE_VALUES = new Set([
   "SFM_MATCH",
   "SFM_MAPPER",
   "SFM",
+  "SFM_DONE",
   "UNDISTORT",
   "GS_TRAINING",
   "MESH_EXTRACTION",
@@ -74,6 +77,11 @@ function normalizeApiStatus(value) {
     case "running":
     case "processing":
       return "processing";
+    case "waiting_gs":
+    case "waiting-gs":
+    case "sfm_done":
+    case "sfm-done":
+      return WAITING_GS_STATUS;
     case "succeeded":
     case "success":
     case "ready":
@@ -90,6 +98,17 @@ function normalizeApiStatus(value) {
   }
 }
 
+function normalizeViewerKind(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "sfm" || normalized === "pointcloud" || normalized === "point_cloud") {
+    return "sfm";
+  }
+  if (normalized === "gs" || normalized === "gaussian" || normalized === "gaussian_splat") {
+    return "gs";
+  }
+  return null;
+}
+
 export function mapJobStatus(status) {
   switch (status) {
     case "QUEUED":
@@ -97,6 +116,8 @@ export function mapJobStatus(status) {
       return "queued";
     case "RUNNING":
       return "processing";
+    case "WAITING_GS":
+      return WAITING_GS_STATUS;
     case "SUCCEEDED":
       return READY_STATUS;
     case "FAILED":
@@ -224,21 +245,73 @@ function resolveMetrics(progressDoc, statusDoc) {
   return {};
 }
 
-function resolveStatus(dbStatus, progressDoc, statusDoc) {
+function isNewerDoc(candidateDoc, baseDoc) {
+  const candidateDate = toDateOrNull(candidateDoc?.updatedAt);
+  const baseDate = toDateOrNull(baseDoc?.updatedAt);
+  if (!candidateDate || !baseDate) {
+    return false;
+  }
+
+  return candidateDate.getTime() >= baseDate.getTime();
+}
+
+function isSfmPhaseSucceeded(job, statusDoc) {
+  if (job?.pipeline !== DEFAULT_PIPELINE) {
+    return false;
+  }
+
+  if (normalizeApiStatus(statusDoc?.status) !== READY_STATUS) {
+    return false;
+  }
+
+  const outputs = isPlainObject(statusDoc?.outputs) ? statusDoc.outputs : {};
   return (
-    normalizeApiStatus(statusDoc?.status) ??
-    normalizeApiStatus(progressDoc?.status) ??
-    mapJobStatus(dbStatus)
+    normalizeStorageKey(outputs.sfmResultKey) !== null &&
+    normalizeStorageKey(outputs.gaussianSplatKey) === null &&
+    normalizeStorageKey(outputs.resultKey) === null
   );
 }
 
+function resolveStatus(job, progressDoc, statusDoc) {
+  const progressStatus = normalizeApiStatus(progressDoc?.status);
+  const statusStatus = normalizeApiStatus(statusDoc?.status);
+  const dbStatus = mapJobStatus(job.status);
+  const sfmPhaseSucceeded = isSfmPhaseSucceeded(job, statusDoc);
+
+  if (job.status === "RUNNING" && sfmPhaseSucceeded) {
+    if (job.stage !== "GS_TRAINING" && !job.gsBatchJobId && progressStatus === READY_STATUS) {
+      return WAITING_GS_STATUS;
+    }
+    return progressStatus === "failed" || progressStatus === "canceled"
+      ? progressStatus
+      : "processing";
+  }
+
+  if (sfmPhaseSucceeded) {
+    return WAITING_GS_STATUS;
+  }
+
+  if (progressStatus && progressStatus !== "queued" && isNewerDoc(progressDoc, statusDoc)) {
+    return progressStatus;
+  }
+
+  return statusStatus ?? progressStatus ?? dbStatus;
+}
+
 function resolveProgress(dbProgressPercent, resolvedStatus, progressDoc) {
+  const fromDb = clamp(Number(dbProgressPercent ?? 0) / 100, 0, 1);
+  if (resolvedStatus === "processing" && normalizeApiStatus(progressDoc?.status) === READY_STATUS) {
+    return fromDb;
+  }
+
   const progressFromDoc = Number(progressDoc?.progress);
   if (Number.isFinite(progressFromDoc)) {
     return clamp(progressFromDoc, 0, 1);
   }
 
-  const fromDb = clamp(Number(dbProgressPercent ?? 0) / 100, 0, 1);
+  if (resolvedStatus === WAITING_GS_STATUS) {
+    return 1;
+  }
   if (TERMINAL_STATUSES.has(resolvedStatus)) {
     return 1;
   }
@@ -340,6 +413,8 @@ export function getMetaKeys(sceneId, jobId) {
   return {
     progressKey: `scenes/${sceneIdText}/meta/${jobIdText}/progress.json`,
     statusKey: `scenes/${sceneIdText}/meta/${jobIdText}/status.json`,
+    sfmResultKey: `scenes/${sceneIdText}/sfm/${jobIdText}/points.ply`,
+    sfmSparsePointCloudKey: `scenes/${sceneIdText}/sfm/${jobIdText}/sparse/0/points3D.ply`,
     resultKey: `scenes/${sceneIdText}/gs/${jobIdText}/result.ply`
   };
 }
@@ -464,20 +539,34 @@ function dedupeKeys(values) {
 }
 
 async function findViewerAsset(bucketName, resolvedStatus, outputKeys, sceneFallbackKeys) {
-  if (resolvedStatus !== READY_STATUS || (!bucketName && !isLocalStorage())) {
+  return findViewerAssetForKind(bucketName, resolvedStatus, outputKeys, sceneFallbackKeys, null);
+}
+
+async function findViewerAssetForKind(bucketName, resolvedStatus, outputKeys, sceneFallbackKeys, preferredViewerKind) {
+  if (!bucketName && !isLocalStorage()) {
     return null;
   }
 
-  const candidates = dedupeKeys([
-    outputKeys.resultKey,
-    outputKeys.gaussianSplatKey,
-    outputKeys.meshKey,
-    outputKeys.sfmResultKey,
-    sceneFallbackKeys.resultKey,
-    sceneFallbackKeys.gaussianSplatKey,
-    sceneFallbackKeys.meshKey,
-    sceneFallbackKeys.sfmResultKey
-  ]);
+  const candidates = preferredViewerKind === "sfm"
+    ? dedupeKeys([outputKeys.sfmResultKey])
+    : resolvedStatus === "failed"
+    ? dedupeKeys([outputKeys.sfmResultKey])
+    : VIEWABLE_STATUSES.has(resolvedStatus)
+      ? dedupeKeys([
+          outputKeys.resultKey,
+          outputKeys.gaussianSplatKey,
+          outputKeys.meshKey,
+          outputKeys.sfmResultKey,
+          sceneFallbackKeys.resultKey,
+          sceneFallbackKeys.gaussianSplatKey,
+          sceneFallbackKeys.meshKey,
+          sceneFallbackKeys.sfmResultKey
+        ])
+      : [];
+
+  if (candidates.length === 0) {
+    return null;
+  }
 
   for (const candidate of candidates) {
     const headResult = await headObjectIfExists(bucketName, candidate);
@@ -494,10 +583,37 @@ async function findViewerAsset(bucketName, resolvedStatus, outputKeys, sceneFall
   return null;
 }
 
+async function resolveExistingSfmResultKey(bucketName, keys, outputKeys) {
+  const currentSfmResultKey = normalizeStorageKey(outputKeys.sfmResultKey);
+  const currentDerivedPointKey = currentSfmResultKey ? normalizeStorageKey(`${currentSfmResultKey}/points3D.ply`) : null;
+  const candidates = dedupeKeys([
+    currentSfmResultKey,
+    currentDerivedPointKey,
+    keys.sfmResultKey,
+    keys.sfmSparsePointCloudKey
+  ]);
+
+  for (const candidate of candidates) {
+    const headResult = await headObjectIfExists(bucketName, candidate);
+    if (!headResult) {
+      continue;
+    }
+
+    return {
+      ...outputKeys,
+      sfmResultKey: candidate
+    };
+  }
+
+  return outputKeys;
+}
+
 function deriveDbStatus(apiStatus, currentDbStatus) {
   switch (apiStatus) {
     case "processing":
       return "RUNNING";
+    case WAITING_GS_STATUS:
+      return "WAITING_GS";
     case READY_STATUS:
       return "SUCCEEDED";
     case "failed":
@@ -618,8 +734,8 @@ export async function buildJobReadModel(job, options = {}) {
     job.id
   );
 
-  const status = resolveStatus(job.status, progressDoc, statusDoc);
-  const stage = resolveStage(job.stage, progressDoc, statusDoc);
+  const status = resolveStatus(job, progressDoc, statusDoc);
+  const stage = status === WAITING_GS_STATUS ? "SFM_DONE" : resolveStage(job.stage, progressDoc, statusDoc);
   const progress = resolveProgress(job.progressPercent, status, progressDoc);
   const progressPercent = clamp(Math.round(progress * 100), 0, 100);
   const detail = resolveDetail(job.errorMessage, progressDoc, statusDoc);
@@ -628,7 +744,11 @@ export async function buildJobReadModel(job, options = {}) {
   const finishedAt = resolveFinishedAt(job.endedAt, status, updatedAt, progressDoc, statusDoc);
   const metrics = resolveMetrics(progressDoc, statusDoc);
 
-  const outputKeys = resolveOutputKeys(job, statusDoc, keys.resultKey);
+  const outputKeys = await resolveExistingSfmResultKey(
+    bucketName,
+    keys,
+    resolveOutputKeys(job, statusDoc, keys.resultKey)
+  );
   const sceneFallbackKeys = resolveSceneFallbackKeys(job.scene);
 
   if (options.syncDb !== false) {
@@ -644,14 +764,22 @@ export async function buildJobReadModel(job, options = {}) {
     });
   }
 
-  const viewerAsset = await findViewerAsset(
+  const preferredViewerKind = normalizeViewerKind(options.viewerKind ?? options.preferredViewerKind);
+  const viewerAsset = await findViewerAssetForKind(
     bucketName,
     status,
     outputKeys,
-    sceneFallbackKeys
+    sceneFallbackKeys,
+    preferredViewerKind
   );
   const viewerReady = viewerAsset !== null;
   const outputs = buildOutputsResponse(bucketName, outputKeys, sceneFallbackKeys, viewerAsset);
+  const viewerKind =
+    viewerAsset?.key && outputKeys.sfmResultKey && viewerAsset.key === outputKeys.sfmResultKey
+      ? "sfm"
+      : viewerAsset
+        ? "gs"
+        : null;
 
   return {
     keys,
@@ -667,8 +795,9 @@ export async function buildJobReadModel(job, options = {}) {
     startedAt,
     finishedAt,
     outputs,
+    viewerKind,
     viewerReady,
-    postable: viewerReady && !job.post,
+    postable: viewerReady && viewerKind === "gs" && !job.post,
     file: viewerAsset ? buildFileInfo(viewerAsset.headResult) : null,
     resultUrl: viewerAsset ? buildPublicS3Url(bucketName, viewerAsset.key) : null
   };

@@ -1,4 +1,7 @@
 import { v4 as uuid } from "uuid";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
 import { prisma } from "../db.config.js";
 import {
   buildStorageUploadUrl,
@@ -6,6 +9,7 @@ import {
   headStorageObject,
   isLocalStorage,
   normalizeStorageKey,
+  resolveLocalStoragePath,
   writeLocalStorageObject
 } from "../utils/storage.js";
 
@@ -13,6 +17,10 @@ const ALLOWED_VIDEO_CONTENT_TYPES = ["video/mp4"];
 const PRESIGNED_URL_EXPIRES_IN_SECONDS = 60 * 5;
 const DEFAULT_UPLOADING_SCENE_TTL_MINUTES = 60;
 const SCENE_LIST_PAGE_SIZE = 5;
+const DEFAULT_VIDEO_TRANSCODE_CRF = "20";
+const DEFAULT_VIDEO_TRANSCODE_PRESET = "veryfast";
+const DEFAULT_VIDEO_AUDIO_BITRATE = "128k";
+const PLAYBACK_VIDEO_SUFFIX = "_h264.mp4";
 
 function parseBigInt(value) {
   try {
@@ -40,6 +48,98 @@ function getUploadingSceneTtlMinutes() {
 
 function buildExpectedVideoInputPrefix(sceneId) {
   return `scenes/${sceneId}/input/video/`;
+}
+
+function isVideoTranscodeEnabled() {
+  const raw = String(process.env.VIDEO_TRANSCODE_ENABLED ?? "true").trim().toLowerCase();
+  return raw !== "false" && raw !== "0" && raw !== "off";
+}
+
+function buildBrowserPlaybackVideoKey(inputKey) {
+  const parsed = path.posix.parse(inputKey);
+  if (parsed.base.endsWith(PLAYBACK_VIDEO_SUFFIX)) {
+    return inputKey;
+  }
+  return `${parsed.dir}/${parsed.name}${PLAYBACK_VIDEO_SUFFIX}`;
+}
+
+function appendLimitedStderr(current, chunk) {
+  const next = `${current}${chunk}`;
+  return next.length > 4000 ? next.slice(next.length - 4000) : next;
+}
+
+function runFfmpegTranscode(inputPath, outputPath) {
+  const ffmpegPath = String(process.env.FFMPEG_PATH ?? "ffmpeg").trim() || "ffmpeg";
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    String(process.env.VIDEO_TRANSCODE_PRESET ?? DEFAULT_VIDEO_TRANSCODE_PRESET),
+    "-crf",
+    String(process.env.VIDEO_TRANSCODE_CRF ?? DEFAULT_VIDEO_TRANSCODE_CRF),
+    "-pix_fmt",
+    "yuv420p",
+    "-profile:v",
+    "high",
+    "-level",
+    "4.1",
+    "-c:a",
+    "aac",
+    "-b:a",
+    String(process.env.VIDEO_TRANSCODE_AUDIO_BITRATE ?? DEFAULT_VIDEO_AUDIO_BITRATE),
+    "-movflags",
+    "+faststart",
+    outputPath
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    let stderr = "";
+
+    child.stderr.on("data", (chunk) => {
+      stderr = appendLimitedStderr(stderr, chunk.toString("utf8"));
+    });
+    child.on("error", (err) => {
+      reject(err);
+    });
+    child.on("close", (exitCode) => {
+      if (exitCode === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`ffmpeg exited with code ${exitCode}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function prepareBrowserCompatibleLocalVideo(inputKey) {
+  if (!isLocalStorage() || !isVideoTranscodeEnabled()) {
+    return inputKey;
+  }
+
+  const input = resolveLocalStoragePath(inputKey);
+  const outputKey = buildBrowserPlaybackVideoKey(inputKey);
+  const output = resolveLocalStoragePath(outputKey);
+  if (!input || !output) {
+    throw new Error("invalid local video storage key");
+  }
+
+  if (input.filePath === output.filePath) {
+    return inputKey;
+  }
+
+  await fs.mkdir(path.dirname(output.filePath), { recursive: true });
+  await runFfmpegTranscode(input.filePath, output.filePath);
+  return outputKey;
 }
 
 function buildLocalVideoUploadUrl(sceneId, key) {
@@ -360,7 +460,8 @@ export async function completeVideoUpload(req, res) {
       }
     }
 
-    if (scene.inputVideoKey === normalizedKey) {
+    const expectedPlaybackKey = buildBrowserPlaybackVideoKey(normalizedKey);
+    if (scene.inputVideoKey === expectedPlaybackKey && expectedPlaybackKey !== normalizedKey) {
       return res.status(200).json({
         ok: true,
         sceneId: scene.id.toString(),
@@ -368,7 +469,11 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
-    if (scene.inputVideoKey && scene.inputVideoKey !== normalizedKey) {
+    if (
+      scene.inputVideoKey &&
+      scene.inputVideoKey !== normalizedKey &&
+      scene.inputVideoKey !== expectedPlaybackKey
+    ) {
       return res.status(409).json({
         ok: false,
         message: "이미 다른 영상 key가 저장되어 있습니다."
@@ -383,12 +488,39 @@ export async function completeVideoUpload(req, res) {
       });
     }
 
+    let inputVideoKey = normalizedKey;
+    try {
+      inputVideoKey = await prepareBrowserCompatibleLocalVideo(normalizedKey);
+    } catch (transcodeErr) {
+      console.error("prepareBrowserCompatibleLocalVideo failed", transcodeErr);
+      await prisma.scenes.update({
+        where: {
+          id: parsedSceneId
+        },
+        data: {
+          status: "FAILED"
+        }
+      });
+      return res.status(500).json({
+        ok: false,
+        message: "브라우저 호환 영상 변환 실패"
+      });
+    }
+
+    if (scene.inputVideoKey === inputVideoKey) {
+      return res.status(200).json({
+        ok: true,
+        sceneId: scene.id.toString(),
+        inputVideoKey: scene.inputVideoKey
+      });
+    }
+
     const updated = await prisma.scenes.update({
       where: {
         id: parsedSceneId
       },
       data: {
-        inputVideoKey: normalizedKey,
+        inputVideoKey,
         status: "UPLOADED"
       }
     });

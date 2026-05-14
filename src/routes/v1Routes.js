@@ -7,7 +7,8 @@ import {
   getSceneJobProgress,
   getSceneJobStatus,
   listSceneKeyframeSets,
-  listSceneJobs
+  listSceneJobs,
+  runSceneJobGs
 } from "../controllers/jobController.js";
 import {
   completePostThumbnailUpload,
@@ -65,6 +66,12 @@ router.post(
   "/scenes/:sceneId/jobs",
   sessionAuthV1Middleware,
   createSceneJob
+);
+
+router.post(
+  "/scenes/:sceneId/jobs/:jobId/gs",
+  sessionAuthV1Middleware,
+  runSceneJobGs
 );
 
 router.get(

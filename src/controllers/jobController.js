@@ -35,6 +35,7 @@ const jobBaseSelect = {
   progressPercent: true,
   errorMessage: true,
   batchJobId: true,
+  gsBatchJobId: true,
   updatedAt: true,
   startedAt: true,
   endedAt: true,
@@ -204,6 +205,7 @@ function buildKeyframeSetKeys(storagePrefix) {
     selectedFramesCsvKey: `${prefix}/selected_frames.csv`,
     metricsKey: `${prefix}/selection_metrics.json`,
     configKey: `${prefix}/config.yaml`,
+    latentHtmlKey: `${prefix}/latent_space.html`,
     frameIndexPlotKey: `${prefix}/frame_index_comparison.png`,
     timelineComparisonKey: `${prefix}/timeline_comparison.mp4`,
     statusKey: `${prefix}/status.json`
@@ -232,6 +234,8 @@ function serializeKeyframeSet(keyframeSet, activeKeyframeSetId = null) {
     selectedFramesCsvKey: keyframeSet.selectedFramesCsvKey ?? keys.selectedFramesCsvKey,
     metricsKey: keyframeSet.metricsKey ?? keys.metricsKey,
     configKey: keyframeSet.configKey ?? keys.configKey,
+    latentHtmlKey: keys.latentHtmlKey,
+    latentHtmlUrl: buildPublicStorageUrl(bucketName, keys.latentHtmlKey),
     frameIndexPlotKey: keyframeSet.frameIndexPlotKey ?? keys.frameIndexPlotKey,
     frameIndexPlotUrl: buildPublicStorageUrl(bucketName, keyframeSet.frameIndexPlotKey ?? keys.frameIndexPlotKey),
     timelineComparisonKey: keyframeSet.timelineComparisonKey ?? keys.timelineComparisonKey,
@@ -308,7 +312,8 @@ function appendOptionalPipelineEnv(args) {
     "KEYFRAME_PRECLUSTER_MIN_LOCAL_THRESHOLD_RATIO",
     "KEYFRAME_PRECLUSTER_MAX_NEIGHBOR_HIGH_COUNT",
     "KEYFRAME_PRECLUSTER_MIN_CLUSTER_FRAMES",
-    "KEYFRAME_PRECLUSTER_MIN_FRAMES_PER_CLUSTER"
+    "KEYFRAME_PRECLUSTER_MIN_FRAMES_PER_CLUSTER",
+    "GS_DATA_DEVICE"
   ];
 
   for (const name of names) {
@@ -774,6 +779,7 @@ async function serializeJob(job, readModel) {
     pipeline: job.pipeline,
     keyframeSetId: job.keyframeSetId ? toResponseId(job.keyframeSetId) : null,
     sourceJobId: job.sourceJobId ? toResponseId(job.sourceJobId) : null,
+    gsBatchJobId: job.gsBatchJobId ?? null,
     keyframeSet: serializeKeyframeSet(job.keyframeSet, job.scene?.activeKeyframeSetId ?? null),
     status: readModel.status,
     stage: readModel.stage,
@@ -786,6 +792,8 @@ async function serializeJob(job, readModel) {
     finishedAt: readModel.finishedAt,
     errorMessage: readModel.status === "failed" ? readModel.detail : null,
     viewerReady: readModel.viewerReady,
+    viewerKind: readModel.viewerKind,
+    canRunGs: readModel.status === "waiting_gs" && Boolean(readModel.outputs.sfmResultKey),
     postable: readModel.postable,
     alreadyPosted: postId !== null,
     postId,
@@ -1046,21 +1054,22 @@ export async function createSceneKeyframeSet(req, res) {
 
     const scene = loadedScene.scene;
     if (!scene.uploadId || !scene.inputVideoKey) {
-      return sendApiError(res, req, 400, "BAD_REQUEST", "업로드 완료된 scene만 KS 생성이 가능합니다.");
+      return sendApiError(res, req, 400, "BAD_REQUEST", "업로드 완료된 scene만 KS+SfM job 생성이 가능합니다.");
     }
 
+    const iteration = parsePositiveInt(process.env.KEYFRAME_GS_ITERS) ?? DEFAULT_AUTOMATED_ITERATION;
     const keyframeSet = await createKeyframeSetRecord(sceneId);
     const job = await prisma.jobs.create({
       data: {
         sceneId,
         keyframeSetId: keyframeSet.id,
         uploadId: scene.uploadId,
-        pipeline: KEYFRAME_PIPELINE,
+        pipeline: DEFAULT_PIPELINE,
         imageCount: DEFAULT_AUTOMATED_IMAGE_COUNT,
         overlap: DEFAULT_AUTOMATED_OVERLAP,
-        iteration: 0,
+        iteration,
         status: "QUEUED",
-        stage: "IMAGESET_BUILDING",
+        stage: "INSTANCE_CREATING",
         progressPercent: 0
       }
     });
@@ -1075,24 +1084,24 @@ export async function createSceneKeyframeSet(req, res) {
               sceneId,
               uploadId: scene.uploadId,
               jobId: job.id,
-              imageCount: 0,
-              overlap: 0,
-              iteration: 0,
-              pipeline: KEYFRAME_PIPELINE,
+              imageCount: DEFAULT_AUTOMATED_IMAGE_COUNT,
+              overlap: DEFAULT_AUTOMATED_OVERLAP,
+              iteration,
+              pipeline: DEFAULT_PIPELINE,
               bucketName: process.env.S3_BUCKET_NAME,
               keyframeSetId: keyframeSet.id,
               keyframesPrefix: keyframeSet.storagePrefix,
-              pipelineStage: "keyframes"
+              pipelineStage: "sfm"
             })
           : await submitJobToLocalDocker({
               sceneId,
               uploadId: scene.uploadId,
               jobId: job.id,
-              pipeline: KEYFRAME_PIPELINE,
+              pipeline: DEFAULT_PIPELINE,
               inputVideoKey: scene.inputVideoKey,
               keyframeSetId: keyframeSet.id,
               keyframesPrefix: keyframeSet.storagePrefix,
-              pipelineStage: "keyframes"
+              pipelineStage: "sfm"
             });
     } catch (submitErr) {
       await prisma.$transaction([
@@ -1117,7 +1126,7 @@ export async function createSceneKeyframeSet(req, res) {
         })
       ]);
       console.error(submitErr);
-      return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS 생성 작업 제출 실패");
+      return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS+SfM 작업 제출 실패");
     }
 
     const [updatedJob, updatedKeyframeSet] = await prisma.$transaction([
@@ -1146,11 +1155,13 @@ export async function createSceneKeyframeSet(req, res) {
       jobId: toResponseId(updatedJob.id),
       batchJobId: submittedJobId,
       runner,
+      pipeline: DEFAULT_PIPELINE,
+      iteration,
       statusKey: keys.statusKey
     });
   } catch (err) {
     console.error(err);
-    return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS 생성 실패");
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "KS+SfM job 생성 실패");
   }
 }
 
@@ -1242,7 +1253,7 @@ export async function createSceneJob(req, res) {
       );
     }
 
-    const pipeline = parsePipeline(req.body?.pipeline);
+    const requestedPipeline = parsePipeline(req.body?.pipeline);
     const requestedKeyframeSetIdRaw = req.body?.keyframeSetId;
     const requestedKeyframeSetId =
       requestedKeyframeSetIdRaw === undefined ||
@@ -1250,24 +1261,26 @@ export async function createSceneJob(req, res) {
       String(requestedKeyframeSetIdRaw).trim().length === 0
         ? null
         : parseBigInt(requestedKeyframeSetIdRaw);
-    const requestedSourceJobIdRaw = req.body?.sourceJobId;
-    const requestedSourceJobId =
-      requestedSourceJobIdRaw === undefined ||
-      requestedSourceJobIdRaw === null ||
-      String(requestedSourceJobIdRaw).trim().length === 0
-        ? null
-        : parseBigInt(requestedSourceJobIdRaw);
     const imageCount = DEFAULT_AUTOMATED_IMAGE_COUNT;
     const overlap = DEFAULT_AUTOMATED_OVERLAP;
     const iteration = parsePositiveInt(process.env.KEYFRAME_GS_ITERS) ?? DEFAULT_AUTOMATED_ITERATION;
 
-    if (pipeline === null) {
+    if (requestedPipeline === null) {
       return sendApiError(
         res,
         req,
         400,
         "BAD_REQUEST",
         "pipeline(3dgs) 값을 확인해주세요."
+      );
+    }
+    if (requestedPipeline === KEYFRAME_PIPELINE || requestedPipeline === GS_PIPELINE) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "Job 생성은 KS+SfM 단계만 지원합니다. GS는 기존 job의 GS 실행 API를 사용해주세요."
       );
     }
     if (
@@ -1282,20 +1295,6 @@ export async function createSceneJob(req, res) {
         400,
         "BAD_REQUEST",
         "keyframeSetId는 숫자여야 합니다."
-      );
-    }
-    if (
-      requestedSourceJobIdRaw !== undefined &&
-      requestedSourceJobIdRaw !== null &&
-      String(requestedSourceJobIdRaw).trim().length > 0 &&
-      requestedSourceJobId === null
-    ) {
-      return sendApiError(
-        res,
-        req,
-        400,
-        "BAD_REQUEST",
-        "sourceJobId는 숫자여야 합니다."
       );
     }
 
@@ -1321,47 +1320,10 @@ export async function createSceneJob(req, res) {
       );
     }
 
-    let sourceJob = null;
-    let sourceSfmPrefix = null;
-    if (pipeline === GS_PIPELINE) {
-      if (!requestedSourceJobId) {
-        return sendApiError(
-          res,
-          req,
-          400,
-          "BAD_REQUEST",
-          "GS job 생성에는 sourceJobId가 필요합니다."
-        );
-      }
-      sourceJob = await loadOwnedJob(sceneId, requestedSourceJobId);
-      if (!sourceJob) {
-        return sendApiError(
-          res,
-          req,
-          404,
-          "SOURCE_JOB_NOT_FOUND",
-          "원본 SfM job을 찾을 수 없습니다."
-        );
-      }
-      const sourceReadModel = await buildJobReadModel(sourceJob, {
-        bucketName: process.env.S3_BUCKET_NAME
-      });
-      if (sourceReadModel.status !== "ready" || !sourceReadModel.outputs.sfmResultKey) {
-        return sendApiError(
-          res,
-          req,
-          409,
-          "SOURCE_SFM_NOT_READY",
-          "READY 상태의 SfM job만 GS 입력으로 사용할 수 있습니다."
-        );
-      }
-      sourceSfmPrefix = buildSfmPrefix(sceneId, sourceJob.id);
-    }
-
     const resolvedKeyframeSet = await resolveJobKeyframeSet({
       scene,
       requestedKeyframeSetId,
-      createIfMissing: pipeline !== GS_PIPELINE
+      createIfMissing: true
     });
     if (resolvedKeyframeSet.error) {
       return sendApiError(
@@ -1372,7 +1334,7 @@ export async function createSceneJob(req, res) {
         resolvedKeyframeSet.error.message
       );
     }
-    if (!resolvedKeyframeSet.keyframeSet && pipeline !== GS_PIPELINE) {
+    if (!resolvedKeyframeSet.keyframeSet) {
       return sendApiError(
         res,
         req,
@@ -1382,15 +1344,15 @@ export async function createSceneJob(req, res) {
       );
     }
 
-    const jobKeyframeSet = resolvedKeyframeSet.keyframeSet ?? sourceJob?.keyframeSet ?? null;
+    const jobKeyframeSet = resolvedKeyframeSet.keyframeSet;
 
     const created = await prisma.jobs.create({
       data: {
         sceneId,
         keyframeSetId: jobKeyframeSet?.id ?? null,
-        sourceJobId: sourceJob?.id ?? null,
+        sourceJobId: null,
         uploadId: scene.uploadId,
-        pipeline,
+        pipeline: DEFAULT_PIPELINE,
         imageCount,
         overlap,
         iteration,
@@ -1412,23 +1374,21 @@ export async function createSceneJob(req, res) {
               imageCount,
               overlap,
               iteration,
-              pipeline,
+              pipeline: DEFAULT_PIPELINE,
               bucketName: process.env.S3_BUCKET_NAME,
               keyframeSetId: jobKeyframeSet?.id ?? null,
               keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
-              pipelineStage: pipelineToStage(pipeline),
-              sourceSfmPrefix
+              pipelineStage: "sfm"
             })
           : await submitJobToLocalDocker({
               sceneId,
               uploadId: scene.uploadId,
               jobId: created.id,
-              pipeline,
+              pipeline: DEFAULT_PIPELINE,
               inputVideoKey: scene.inputVideoKey,
               keyframeSetId: jobKeyframeSet?.id ?? null,
               keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
-              pipelineStage: pipelineToStage(pipeline),
-              sourceSfmPrefix
+              pipelineStage: "sfm"
             });
     } catch (submitErr) {
       const updates = [
@@ -1494,7 +1454,7 @@ export async function createSceneJob(req, res) {
     return res.status(201).json({
       jobId: toResponseId(updated.id),
       sceneId: toResponseId(scene.id),
-      pipeline,
+      pipeline: DEFAULT_PIPELINE,
       imageCount,
       overlap,
       iteration,
@@ -1514,6 +1474,176 @@ export async function createSceneJob(req, res) {
       "INTERNAL_ERROR",
       "scene job 생성 실패"
     );
+  }
+}
+
+export async function runSceneJobGs(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(
+        res,
+        req,
+        401,
+        "UNAUTHORIZED",
+        "세션 사용자 정보가 유효하지 않습니다."
+      );
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    const jobId = parseBigInt(req.params?.jobId);
+    if (sceneId === null || jobId === null) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "sceneId, jobId는 숫자여야 합니다."
+      );
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const scene = loadedScene.scene;
+    if (!scene.uploadId || !scene.inputVideoKey) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "BAD_REQUEST",
+        "업로드 완료된 scene만 GS 실행이 가능합니다."
+      );
+    }
+
+    const job = await loadOwnedJob(sceneId, jobId);
+    if (!job) {
+      return sendApiError(
+        res,
+        req,
+        404,
+        "JOB_NOT_FOUND",
+        "job을 찾을 수 없습니다."
+      );
+    }
+
+    const readModel = await buildJobReadModel(job, {
+      bucketName: process.env.S3_BUCKET_NAME,
+      viewerKind: req.query?.view ?? req.query?.viewerKind ?? req.query?.kind
+    });
+    if (readModel.status === "queued" || readModel.status === "processing") {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "JOB_ALREADY_RUNNING",
+        "현재 실행 중인 job입니다."
+      );
+    }
+    if (!readModel.outputs.sfmResultKey) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "SFM_RESULT_REQUIRED",
+        "GS 실행에는 먼저 완료된 SfM 결과가 필요합니다."
+      );
+    }
+    if (readModel.status === "ready" && readModel.outputs.gaussianSplatKey) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "GS_ALREADY_READY",
+        "이미 GS 결과가 준비된 job입니다."
+      );
+    }
+
+    const sourceSfmPrefix = buildSfmPrefix(sceneId, job.id);
+    let submittedJobId = null;
+    const runner = getPipelineRunner();
+    try {
+      submittedJobId =
+        runner === "aws"
+          ? await submitBatchJobToAws({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: job.id,
+              imageCount: job.imageCount,
+              overlap: job.overlap,
+              iteration: job.iteration,
+              pipeline: DEFAULT_PIPELINE,
+              bucketName: process.env.S3_BUCKET_NAME,
+              keyframeSetId: job.keyframeSetId,
+              keyframesPrefix: job.keyframeSet?.storagePrefix ?? null,
+              pipelineStage: "gs",
+              sourceSfmPrefix
+            })
+          : await submitJobToLocalDocker({
+              sceneId,
+              uploadId: scene.uploadId,
+              jobId: job.id,
+              pipeline: DEFAULT_PIPELINE,
+              inputVideoKey: scene.inputVideoKey,
+              keyframeSetId: job.keyframeSetId,
+              keyframesPrefix: job.keyframeSet?.storagePrefix ?? null,
+              pipelineStage: "gs",
+              sourceSfmPrefix
+            });
+    } catch (submitErr) {
+      await prisma.jobs.update({
+        where: {
+          id: job.id
+        },
+        data: {
+          status: "WAITING_GS",
+          stage: "SFM_DONE",
+          errorMessage: truncateErrorMessage(submitErr)
+        }
+      });
+      console.error(submitErr);
+      return sendApiError(res, req, 500, "INTERNAL_ERROR", "GS 작업 제출 실패");
+    }
+
+    const updated = await prisma.jobs.update({
+      where: {
+        id: job.id
+      },
+      data: {
+        gsBatchJobId: submittedJobId,
+        pipeline: DEFAULT_PIPELINE,
+        status: "RUNNING",
+        stage: "GS_TRAINING",
+        progressPercent: 66,
+        errorMessage: null,
+        endedAt: null
+      },
+      select: jobBaseSelect
+    });
+    const keys = getMetaKeys(sceneId, updated.id);
+
+    return res.status(202).json({
+      jobId: toResponseId(updated.id),
+      sceneId: toResponseId(scene.id),
+      pipeline: DEFAULT_PIPELINE,
+      status: "processing",
+      batchJobId: submittedJobId,
+      runner,
+      sourceSfmPrefix,
+      progressKey: keys.progressKey,
+      statusKey: keys.statusKey
+    });
+  } catch (err) {
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "GS 실행 실패");
   }
 }
 
@@ -1583,6 +1713,8 @@ export async function getSceneJobProgress(req, res) {
       updatedAt: readModel.updatedAt,
       metrics: readModel.metrics,
       viewerReady: readModel.viewerReady,
+      viewerKind: readModel.viewerKind,
+      canRunGs: readModel.status === "waiting_gs" && Boolean(readModel.outputs.sfmResultKey),
       postable: readModel.postable,
       alreadyPosted: postId !== null,
       postId
@@ -1662,6 +1794,8 @@ export async function getSceneJobStatus(req, res) {
       status: readModel.status,
       outputs: readModel.outputs,
       viewerReady: readModel.viewerReady,
+      viewerKind: readModel.viewerKind,
+      canRunGs: readModel.status === "waiting_gs" && Boolean(readModel.outputs.sfmResultKey),
       postable: readModel.postable,
       alreadyPosted: postId !== null,
       postId,
@@ -1745,6 +1879,7 @@ export async function getJobViewer(req, res) {
       pipeline: job.pipeline,
       status: readModel.status,
       viewerReady: readModel.viewerReady,
+      viewerKind: readModel.viewerKind,
       postable: readModel.postable,
       isOwner,
       alreadyPosted: postId !== null,

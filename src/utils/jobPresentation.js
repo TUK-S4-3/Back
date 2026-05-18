@@ -13,6 +13,7 @@ export const WAITING_GS_STATUS = "waiting_gs";
 export const VIEWER_FORMAT = "ply";
 
 const TERMINAL_STATUSES = new Set([READY_STATUS, "failed", "canceled"]);
+const STAGE_RUN_TERMINAL_STATUSES = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
 const VIEWABLE_STATUSES = new Set([READY_STATUS, WAITING_GS_STATUS]);
 const JOB_STAGE_VALUES = new Set([
   "INSTANCE_CREATING",
@@ -61,6 +62,31 @@ function normalizeStorageKey(value) {
   return value.trim();
 }
 
+function parseBigIntOrNull(value) {
+  if (typeof value === "bigint") {
+    return value;
+  }
+
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+    return BigInt(value);
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    return null;
+  }
+
+  try {
+    return BigInt(trimmed);
+  } catch {
+    return null;
+  }
+}
+
 function normalizeApiStatus(value) {
   if (typeof value !== "string") {
     return null;
@@ -93,6 +119,27 @@ function normalizeApiStatus(value) {
     case "cancelled":
     case "canceled":
       return "canceled";
+    default:
+      return null;
+  }
+}
+
+function normalizeStageRunStatus(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toUpperCase();
+  switch (normalized) {
+    case "QUEUED":
+    case "SUBMITTED":
+    case "RUNNING":
+    case "SUCCEEDED":
+    case "FAILED":
+      return normalized;
+    case "CANCELED":
+    case "CANCELLED":
+      return "CANCELLED";
     default:
       return null;
   }
@@ -277,6 +324,10 @@ function resolveStatus(job, progressDoc, statusDoc) {
   const statusStatus = normalizeApiStatus(statusDoc?.status);
   const dbStatus = mapJobStatus(job.status);
   const sfmPhaseSucceeded = isSfmPhaseSucceeded(job, statusDoc);
+
+  if (job.status === "CANCELLED" || job.cancelRequested) {
+    return "canceled";
+  }
 
   if (job.status === "RUNNING" && sfmPhaseSucceeded) {
     if (job.stage !== "GS_TRAINING" && !job.gsBatchJobId && progressStatus === READY_STATUS) {
@@ -549,6 +600,15 @@ async function findViewerAssetForKind(bucketName, resolvedStatus, outputKeys, sc
 
   const candidates = preferredViewerKind === "sfm"
     ? dedupeKeys([outputKeys.sfmResultKey])
+    : preferredViewerKind === "gs"
+    ? dedupeKeys([
+        outputKeys.resultKey,
+        outputKeys.gaussianSplatKey,
+        outputKeys.meshKey,
+        sceneFallbackKeys.resultKey,
+        sceneFallbackKeys.gaussianSplatKey,
+        sceneFallbackKeys.meshKey
+      ])
     : resolvedStatus === "failed"
     ? dedupeKeys([outputKeys.sfmResultKey])
     : VIEWABLE_STATUSES.has(resolvedStatus)
@@ -699,6 +759,42 @@ async function syncJobState({
   });
 }
 
+async function syncStageRunState(statusDoc) {
+  const stageRunId = parseBigIntOrNull(statusDoc?.stageRunId);
+  const nextStatus = normalizeStageRunStatus(statusDoc?.status);
+  if (stageRunId === null || nextStatus === null) {
+    return;
+  }
+
+  const data = {
+    status: nextStatus
+  };
+  if (nextStatus === "FAILED") {
+    data.errorCode =
+      typeof statusDoc?.errorCode === "string" && statusDoc.errorCode.trim()
+        ? statusDoc.errorCode.trim().slice(0, 64)
+        : null;
+    data.errorMessage =
+      typeof statusDoc?.errorMessage === "string" && statusDoc.errorMessage.trim()
+        ? statusDoc.errorMessage.trim().slice(0, 255)
+        : null;
+  } else if (nextStatus === "SUCCEEDED") {
+    data.errorCode = null;
+    data.errorMessage = null;
+  }
+
+  if (STAGE_RUN_TERMINAL_STATUSES.has(nextStatus)) {
+    data.endedAt = toDateOrNull(statusDoc?.updatedAt) ?? new Date();
+  }
+
+  await prisma.job_stage_runs.updateMany({
+    where: {
+      id: stageRunId
+    },
+    data
+  });
+}
+
 function buildOutputsResponse(bucketName, outputKeys, sceneFallbackKeys, viewerAsset) {
   const gaussianSplatKey =
     outputKeys.gaussianSplatKey ?? sceneFallbackKeys.gaussianSplatKey ?? null;
@@ -762,6 +858,7 @@ export async function buildJobReadModel(job, options = {}) {
       startedAt,
       finishedAt
     });
+    await syncStageRunState(statusDoc);
   }
 
   const preferredViewerKind = normalizeViewerKind(options.viewerKind ?? options.preferredViewerKind);

@@ -1,4 +1,10 @@
-import { GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -173,6 +179,85 @@ export async function writeLocalStorageObject(key, body) {
   await fs.mkdir(path.dirname(resolved.filePath), { recursive: true });
   await fs.writeFile(resolved.filePath, body);
   return resolved;
+}
+
+async function deleteS3Objects(bucketName, keys) {
+  let deletedCount = 0;
+  for (let index = 0; index < keys.length; index += 1000) {
+    const chunk = keys.slice(index, index + 1000);
+    if (!chunk.length) continue;
+    await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: bucketName,
+        Delete: {
+          Objects: chunk.map((Key) => ({ Key })),
+          Quiet: true
+        }
+      })
+    );
+    deletedCount += chunk.length;
+  }
+  return deletedCount;
+}
+
+export async function deleteStoragePrefix(bucketName, prefix) {
+  const normalizedPrefix = normalizeStorageKey(prefix);
+  if (!normalizedPrefix) {
+    return {
+      prefix: null,
+      deletedCount: 0
+    };
+  }
+
+  if (isLocalStorage()) {
+    const resolved = resolveLocalStoragePath(normalizedPrefix);
+    if (!resolved) {
+      return {
+        prefix: normalizedPrefix,
+        deletedCount: 0
+      };
+    }
+
+    await fs.rm(resolved.filePath, { recursive: true, force: true });
+    return {
+      prefix: normalizedPrefix,
+      deletedCount: 1
+    };
+  }
+
+  if (!bucketName) {
+    throw new Error("S3_BUCKET_NAME 환경변수가 필요합니다.");
+  }
+
+  const folderPrefix = normalizedPrefix.endsWith("/")
+    ? normalizedPrefix
+    : `${normalizedPrefix}/`;
+  const keys = new Set([normalizedPrefix]);
+  let continuationToken;
+
+  do {
+    const result = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucketName,
+        Prefix: folderPrefix,
+        ContinuationToken: continuationToken
+      })
+    );
+
+    for (const item of result.Contents ?? []) {
+      if (item.Key) {
+        keys.add(item.Key);
+      }
+    }
+
+    continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined;
+  } while (continuationToken);
+
+  const deletedCount = await deleteS3Objects(bucketName, [...keys]);
+  return {
+    prefix: normalizedPrefix,
+    deletedCount
+  };
 }
 
 export async function headStorageObject(bucketName, key) {

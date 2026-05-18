@@ -66,6 +66,20 @@ enum JobStage {
   DONE
 }
 
+enum JobStageRunStage {
+  KS_SFM
+  GS
+}
+
+enum JobStageRunStatus {
+  QUEUED
+  SUBMITTED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
 enum KeyframeSetStatus {
   PENDING
   RUNNING
@@ -174,6 +188,7 @@ model jobs {
   scene            scenes          @relation(fields: [sceneId], references: [id], onDelete: Cascade)
   keyframeSet      keyframe_sets?  @relation(fields: [keyframeSetId], references: [id], onDelete: SetNull)
   post             posts?
+  stageRuns        job_stage_runs[]
 
   @@unique([batchJobId], map: "uk_batch_job_id")
   @@index([sceneId, createdAt], map: "idx_jobs_scene_created")
@@ -185,6 +200,33 @@ model jobs {
   @@index([uploadId], map: "idx_jobs_upload_id")
   @@index([pipeline], map: "idx_jobs_pipeline")
   @@map("jobs")
+}
+
+model job_stage_runs {
+  id           BigInt            @id @default(autoincrement()) @db.UnsignedBigInt
+  jobId        BigInt            @db.UnsignedBigInt @map("job_id")
+  stage        JobStageRunStage
+  containerId  String?           @db.VarChar(128) @map("container_id")
+  status       JobStageRunStatus @default(QUEUED)
+
+  configKey    String?           @db.VarChar(1024) @map("config_key")
+  logsPrefix   String?           @db.VarChar(1024) @map("logs_prefix")
+  outputsJson  Json?             @map("outputs_json")
+
+  errorCode    String?           @db.VarChar(50) @map("error_code")
+  errorMessage String?           @db.VarChar(255) @map("error_message")
+
+  startedAt    DateTime?         @map("started_at")
+  endedAt      DateTime?         @map("ended_at")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  job          jobs              @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, stage, createdAt], map: "idx_job_stage_runs_job_stage_created")
+  @@index([status, createdAt], map: "idx_job_stage_runs_status_created")
+  @@index([containerId], map: "idx_job_stage_runs_container_id")
+  @@map("job_stage_runs")
 }
 
 model keyframe_sets {

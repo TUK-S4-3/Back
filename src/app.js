@@ -39,6 +39,9 @@ passport.deserializeUser(async (id, done) => {
 const app = express();
 const PORT = process.env.PORT;
 const isProduction = process.env.NODE_ENV === "production";
+if (isProduction) {
+  app.set("trust proxy", 1);
+}
 const corsOrigins = (
   process.env.CORS_ORIGIN ?? process.env.FRONTEND_URL ?? "http://localhost:5173"
 )
@@ -167,6 +170,68 @@ async function getAuthSessionStatus(req, res) {
 
 app.get("/api/auth/me", getAuthSessionStatus);
 app.get("/api/auth/session", getAuthSessionStatus);
+
+app.post("/api/auth/demo/login", async (req, res) => {
+  if (process.env.ENABLE_DEMO_LOGIN !== "true") {
+    return res.status(403).json({
+      ok: false,
+      message: "데모 로그인 기능이 비활성화되어 있습니다.",
+    });
+  }
+
+  try {
+    const user = await prisma.users.findUnique({
+      where: {
+        id: 1n,
+      },
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        message: "데모 계정을 찾을 수 없습니다.",
+      });
+    }
+
+    const sessionUser = {
+      id: user.id.toString(),
+      name: user.nickname ?? null,
+      email: null,
+      provider: String(user.provider).toLowerCase(),
+    };
+
+    return req.logIn(sessionUser, (loginErr) => {
+      if (loginErr) {
+        return res.status(500).json({
+          ok: false,
+          message: "세션 생성 실패",
+        });
+      }
+
+      return buildAuthResponseUserById(user.id)
+        .then((authUser) =>
+          res.status(200).json({
+            ok: true,
+            message: "데모 계정 로그인 성공",
+            user: authUser,
+          })
+        )
+        .catch((authErr) => {
+          console.error(authErr);
+          return res.status(500).json({
+            ok: false,
+            message: "데모 계정 로그인 실패",
+          });
+        });
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      ok: false,
+      message: "데모 계정 로그인 실패",
+    });
+  }
+});
 
 app.post("/api/auth/dev/login", async (req, res) => {
   if (process.env.NODE_ENV === "production") {

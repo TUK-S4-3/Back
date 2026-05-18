@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
 import { prisma } from "../db.config.js";
 import { sendApiError } from "../utils/apiError.js";
 import {
@@ -10,20 +12,39 @@ import {
 } from "../utils/jobPresentation.js";
 import {
   buildPublicStorageUrl,
+  deleteStoragePrefix,
   getLocalStorageRoot,
   isLocalStorage,
-  readJsonStorageObject
+  readJsonStorageObject,
+  writeLocalStorageObject
 } from "../utils/storage.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 const DEFAULT_AUTOMATED_IMAGE_COUNT = 0;
 const DEFAULT_AUTOMATED_OVERLAP = 0;
-const DEFAULT_AUTOMATED_ITERATION = 30000;
+const DEFAULT_AUTOMATED_ITERATION = 21000;
+const DEFAULT_KEYFRAME_ENV = {
+  KEYFRAME_EPOCHS: "200",
+  KEYFRAME_PRECLUSTER_GLOBAL_PERCENTILE: "99.8",
+  KEYFRAME_PRECLUSTER_LOCAL_MAD_MULTIPLIER: "6.0",
+  KEYFRAME_PRECLUSTER_MIN_LOCAL_MEDIAN_RATIO: "18.0",
+  KEYFRAME_PRECLUSTER_MIN_LOCAL_THRESHOLD_RATIO: "5.0",
+  KEYFRAME_PRECLUSTER_MAX_NEIGHBOR_HIGH_COUNT: "0",
+  SFM_MAX_OVERLAP: "100"
+};
 const KEYFRAME_PIPELINE = "keyframes";
 const SFM_PIPELINE = "sfm";
 const GS_PIPELINE = "gs";
 const SUPPORTED_PIPELINES = new Set([DEFAULT_PIPELINE, KEYFRAME_PIPELINE, SFM_PIPELINE, GS_PIPELINE]);
+const KS_SFM_STAGE_RUN = "KS_SFM";
+const GS_STAGE_RUN = "GS";
+const DEFAULT_KS_SFM_DOCKER_IMAGE = "pipeline-ks-sfm:latest";
+const DEFAULT_GS_DOCKER_IMAGE = "pipeline-gs:latest";
+const CANCELABLE_JOB_STATUSES = new Set(["QUEUED", "SUBMITTED", "RUNNING", "WAITING_GS"]);
+const STAGE_RUN_ACTIVE_STATUSES = ["QUEUED", "SUBMITTED", "RUNNING"];
+const JOB_CANCELLED_ERROR_CODE = "JOB_CANCELLED";
+const JOB_CANCELLED_MESSAGE = "사용자에 의해 중단됨";
 
 const jobBaseSelect = {
   id: true,
@@ -33,6 +54,8 @@ const jobBaseSelect = {
   status: true,
   stage: true,
   progressPercent: true,
+  cancelRequested: true,
+  errorCode: true,
   errorMessage: true,
   batchJobId: true,
   gsBatchJobId: true,
@@ -260,6 +283,191 @@ function buildSfmPrefix(sceneId, jobId) {
   return `scenes/${sceneId.toString()}/sfm/${jobId.toString()}`;
 }
 
+function buildSceneStoragePrefix(sceneId) {
+  return `scenes/${sceneId.toString()}`;
+}
+
+function buildJobStoragePrefixes(sceneId, jobId) {
+  const sceneIdText = sceneId.toString();
+  const jobIdText = jobId.toString();
+  return [
+    `scenes/${sceneIdText}/meta/${jobIdText}`,
+    `scenes/${sceneIdText}/logs/${jobIdText}`,
+    `scenes/${sceneIdText}/sfm/${jobIdText}`,
+    `scenes/${sceneIdText}/gs/${jobIdText}`,
+    `scenes/${sceneIdText}/thumb/${jobIdText}`
+  ];
+}
+
+function isRunningJobStatus(status) {
+  return status === "QUEUED" || status === "SUBMITTED" || status === "RUNNING";
+}
+
+function isCancelableJobStatus(status) {
+  return CANCELABLE_JOB_STATUSES.has(status);
+}
+
+function isStoragePermissionError(err) {
+  return err?.code === "EACCES" || err?.code === "EPERM";
+}
+
+async function deleteStoragePrefixes(prefixes) {
+  const bucketName = process.env.S3_BUCKET_NAME;
+  const results = [];
+  for (const prefix of prefixes) {
+    results.push(await deleteStoragePrefix(bucketName, prefix));
+  }
+  return results;
+}
+
+function buildCancelKey(sceneId, jobId) {
+  return `scenes/${sceneId.toString()}/meta/${jobId.toString()}/cancel.json`;
+}
+
+function buildStageStatusKey(sceneId, jobId, stage) {
+  return `scenes/${sceneId.toString()}/meta/${jobId.toString()}/stages/${stageRunSlug(stage)}/status.json`;
+}
+
+function buildStageOutputPrefixes(sceneId, jobId, stage) {
+  const sceneIdText = sceneId.toString();
+  const jobIdText = jobId.toString();
+  if (stage === GS_STAGE_RUN) {
+    return [`scenes/${sceneIdText}/gs/${jobIdText}`, `scenes/${sceneIdText}/thumb/${jobIdText}`];
+  }
+  if (stage === KS_SFM_STAGE_RUN) {
+    return [`scenes/${sceneIdText}/sfm/${jobIdText}`];
+  }
+  return [];
+}
+
+function inferCancelableStage(job, stageRun) {
+  if (stageRun?.stage === KS_SFM_STAGE_RUN || stageRun?.stage === GS_STAGE_RUN) {
+    return stageRun.stage;
+  }
+  if (job?.stage === "GS_TRAINING" || job?.stage === "MESH_EXTRACTION") {
+    return GS_STAGE_RUN;
+  }
+  if (job?.status === "RUNNING" || job?.status === "SUBMITTED" || job?.status === "QUEUED") {
+    return KS_SFM_STAGE_RUN;
+  }
+  return null;
+}
+
+function buildSceneOutputClearData(scene, sceneId, jobId, stage) {
+  const sceneIdText = sceneId.toString();
+  const jobIdText = jobId.toString();
+  const data = {};
+  if (stage === KS_SFM_STAGE_RUN) {
+    const sfmPrefix = `scenes/${sceneIdText}/sfm/${jobIdText}/`;
+    if (scene?.sfmResultKey?.startsWith(sfmPrefix)) {
+      data.sfmResultKey = null;
+    }
+  }
+  if (stage === GS_STAGE_RUN) {
+    const gsPrefix = `scenes/${sceneIdText}/gs/${jobIdText}/`;
+    const thumbPrefix = `scenes/${sceneIdText}/thumb/${jobIdText}/`;
+    if (scene?.gaussianSplatKey?.startsWith(gsPrefix)) {
+      data.gaussianSplatKey = null;
+    }
+    if (scene?.meshKey?.startsWith(gsPrefix)) {
+      data.meshKey = null;
+    }
+    if (scene?.thumbnailKey?.startsWith(thumbPrefix)) {
+      data.thumbnailKey = null;
+    }
+  }
+  return data;
+}
+
+function buildJobOutputClearData(stage) {
+  if (stage === KS_SFM_STAGE_RUN) {
+    return {
+      sfmResultKey: null
+    };
+  }
+  if (stage === GS_STAGE_RUN) {
+    return {
+      gaussianSplatKey: null,
+      meshKey: null,
+      thumbnailKey: null
+    };
+  }
+  return {};
+}
+
+async function writeLocalJsonStorageObject(key, value) {
+  await writeLocalStorageObject(key, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function writeCancelMarker({ sceneId, jobId, stageRun, stage }) {
+  const now = new Date().toISOString();
+  await writeLocalJsonStorageObject(buildCancelKey(sceneId, jobId), {
+    sceneId: toResponseId(sceneId),
+    jobId: toResponseId(jobId),
+    stageRunId: stageRun?.id ? toResponseId(stageRun.id) : null,
+    stage: stage ?? null,
+    status: "REQUESTED",
+    requestedAt: now,
+    updatedAt: now
+  });
+}
+
+async function writeCancellationStatusDocs({ job, stageRun, stage }) {
+  const now = new Date().toISOString();
+  const keys = getMetaKeys(job.sceneId, job.id);
+  const base = {
+    sceneId: toResponseId(job.sceneId),
+    jobId: toResponseId(job.id),
+    stageRunId: stageRun?.id ? toResponseId(stageRun.id) : null,
+    status: "CANCELLED",
+    stage: job.stage ?? "CANCELLED",
+    errorCode: JOB_CANCELLED_ERROR_CODE,
+    errorMessage: JOB_CANCELLED_MESSAGE,
+    updatedAt: now
+  };
+  await writeLocalJsonStorageObject(keys.progressKey, {
+    ...base,
+    progress: Math.min(1, Math.max(0, Number(job.progressPercent ?? 0) / 100)),
+    detail: JOB_CANCELLED_MESSAGE,
+    metrics: {
+      frameCount: 0,
+      iter: 0,
+      iters: Number(job.iteration ?? 0)
+    }
+  });
+  await writeLocalJsonStorageObject(keys.statusKey, {
+    ...base,
+    outputs: {}
+  });
+  if (stageRun && stage) {
+    await writeLocalJsonStorageObject(buildStageStatusKey(job.sceneId, job.id, stage), {
+      ...base,
+      stage: stageRunSlug(stage),
+      logsPrefix: stageRun.logsPrefix ?? null,
+      outputs: stageRun.outputsJson ?? {}
+    });
+  }
+}
+
+function getPipelineDockerUser() {
+  const configured = String(process.env.PIPELINE_DOCKER_USER ?? "").trim();
+  if (configured.length > 0) {
+    return configured.toLowerCase() === "none" ? null : configured;
+  }
+
+  if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
+    return null;
+  }
+
+  const uid = process.getuid();
+  const gid = process.getgid();
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
+    return null;
+  }
+
+  return `${uid}:${gid}`;
+}
+
 function truncateErrorMessage(error) {
   const message =
     typeof error?.message === "string" && error.message.trim().length > 0
@@ -267,11 +475,6 @@ function truncateErrorMessage(error) {
       : "처리 실패";
 
   return message.slice(0, 255);
-}
-
-function getPipelineRunner() {
-  const runner = String(process.env.PIPELINE_RUNNER ?? "local").trim().toLowerCase();
-  return runner === "aws" ? "aws" : "local";
 }
 
 function sanitizeContainerName(value) {
@@ -283,6 +486,92 @@ function appendDockerEnv(args, name, value) {
     return;
   }
   args.push("-e", `${name}=${String(value)}`);
+}
+
+function runDockerCommand(args) {
+  const dockerBin = process.env.PIPELINE_DOCKER_BIN ?? "docker";
+  return new Promise((resolve, reject) => {
+    const child = spawn(dockerBin, args, {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        code,
+        stdout: stdout.trim(),
+        stderr: stderr.trim()
+      });
+    });
+  });
+}
+
+function isDockerMissingContainer(result) {
+  const text = `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`.toLowerCase();
+  return text.includes("no such container") || text.includes("not found");
+}
+
+async function stopLocalDockerContainer(containerId) {
+  if (!containerId) {
+    return {
+      stopped: false,
+      missing: false,
+      killed: false
+    };
+  }
+
+  const timeout = Number.parseInt(String(process.env.PIPELINE_DOCKER_STOP_TIMEOUT ?? "10"), 10);
+  const stopTimeout = Number.isFinite(timeout) && timeout >= 0 ? timeout : 10;
+  const stopResult = await runDockerCommand(["stop", "--time", String(stopTimeout), containerId]);
+  if (stopResult.code === 0) {
+    return {
+      stopped: true,
+      missing: false,
+      killed: false
+    };
+  }
+  if (isDockerMissingContainer(stopResult)) {
+    return {
+      stopped: false,
+      missing: true,
+      killed: false
+    };
+  }
+
+  const killResult = await runDockerCommand(["kill", containerId]);
+  if (killResult.code === 0) {
+    return {
+      stopped: true,
+      missing: false,
+      killed: true
+    };
+  }
+  if (isDockerMissingContainer(killResult)) {
+    return {
+      stopped: false,
+      missing: true,
+      killed: false
+    };
+  }
+
+  throw new Error(killResult.stderr || stopResult.stderr || "docker container stop failed");
+}
+
+function resolvePipelineEnvValue(name) {
+  const value = process.env[name];
+  if (value !== undefined && value !== null && String(value).trim().length > 0) {
+    return value;
+  }
+
+  return DEFAULT_KEYFRAME_ENV[name];
 }
 
 function appendOptionalPipelineEnv(args) {
@@ -313,38 +602,153 @@ function appendOptionalPipelineEnv(args) {
     "KEYFRAME_PRECLUSTER_MAX_NEIGHBOR_HIGH_COUNT",
     "KEYFRAME_PRECLUSTER_MIN_CLUSTER_FRAMES",
     "KEYFRAME_PRECLUSTER_MIN_FRAMES_PER_CLUSTER",
+    "SFM_MAX_OVERLAP",
     "GS_DATA_DEVICE"
   ];
 
   for (const name of names) {
-    appendDockerEnv(args, name, process.env[name]);
+    appendDockerEnv(args, name, resolvePipelineEnvValue(name));
   }
 }
 
-async function submitJobToLocalDocker({
+function stageRunSlug(stage) {
+  return stage === GS_STAGE_RUN ? "gs" : "ks-sfm";
+}
+
+function buildStageRunMetadata(sceneId, jobId, stage, options = {}) {
+  const sceneIdText = sceneId.toString();
+  const jobIdText = jobId.toString();
+  const slug = stageRunSlug(stage);
+
+  return {
+    configKey: `scenes/${sceneIdText}/meta/${jobIdText}/stages/${slug}/config.json`,
+    logsPrefix: `scenes/${sceneIdText}/logs/${jobIdText}/${slug}`,
+    outputsJson:
+      stage === GS_STAGE_RUN
+        ? {
+            gsPrefix: `scenes/${sceneIdText}/gs/${jobIdText}`,
+            gaussianSplatKey: `scenes/${sceneIdText}/gs/${jobIdText}/result.ply`
+          }
+        : {
+            keyframesPrefix: options.keyframesPrefix ?? `scenes/${sceneIdText}/keyframes`,
+            sfmPrefix: `scenes/${sceneIdText}/sfm/${jobIdText}`,
+            sfmSparsePrefix: `scenes/${sceneIdText}/sfm/${jobIdText}/sparse/0`
+          }
+  };
+}
+
+async function createStageRunRecord({ jobId, sceneId, stage, keyframesPrefix }) {
+  const metadata = buildStageRunMetadata(sceneId, jobId, stage, {
+    keyframesPrefix
+  });
+  return prisma.job_stage_runs.create({
+    data: {
+      jobId,
+      stage,
+      status: "QUEUED",
+      configKey: metadata.configKey,
+      logsPrefix: metadata.logsPrefix,
+      outputsJson: metadata.outputsJson
+    }
+  });
+}
+
+async function markStageRunSubmitted(stageRunId, containerId) {
+  if (!stageRunId) return null;
+  return prisma.job_stage_runs.update({
+    where: {
+      id: stageRunId
+    },
+    data: {
+      containerId,
+      status: "RUNNING",
+      startedAt: new Date(),
+      errorCode: null,
+      errorMessage: null
+    }
+  });
+}
+
+async function markStageRunSubmitFailed(stageRunId, error) {
+  if (!stageRunId) return null;
+  return prisma.job_stage_runs.update({
+    where: {
+      id: stageRunId
+    },
+    data: {
+      status: "FAILED",
+      endedAt: new Date(),
+      errorMessage: truncateErrorMessage(error)
+    }
+  });
+}
+
+async function findLatestActiveStageRun(jobId) {
+  return prisma.job_stage_runs.findFirst({
+    where: {
+      jobId,
+      status: {
+        in: STAGE_RUN_ACTIVE_STATUSES
+      }
+    },
+    orderBy: {
+      createdAt: "desc"
+    }
+  });
+}
+
+async function resetLocalPipelineWorkDir(dataRoot, workName) {
+  const resolvedDataRoot = path.resolve(dataRoot);
+  const safeWorkName = sanitizeContainerName(workName);
+  const workRoot = path.resolve(resolvedDataRoot, "work", safeWorkName);
+  if (!workRoot.startsWith(`${resolvedDataRoot}${path.sep}work${path.sep}`)) {
+    throw new Error(`Unsafe pipeline work directory: ${workRoot}`);
+  }
+
+  await rm(workRoot, {
+    recursive: true,
+    force: true
+  });
+  await mkdir(workRoot, {
+    recursive: true
+  });
+}
+
+async function submitPipelineStageToLocalDocker({
   sceneId,
   uploadId,
   jobId,
+  image,
+  stage,
+  stageRunId,
   pipeline,
   inputVideoKey,
+  imageCount,
+  overlap,
+  iteration,
   keyframeSetId,
   keyframesPrefix,
-  pipelineStage,
   sourceSfmPrefix
 }) {
   if (!isLocalStorage()) {
     throw new Error("로컬 Docker 실행은 STORAGE_DRIVER=local 설정이 필요합니다.");
   }
 
-  const image = process.env.PIPELINE_DOCKER_IMAGE ?? "pipeline-gs:latest";
   const dockerBin = process.env.PIPELINE_DOCKER_BIN ?? "docker";
   const storageRoot = getLocalStorageRoot();
+  const dataRoot = path.dirname(storageRoot);
+  const containerStorageRoot = `/data/${path.basename(storageRoot)}`;
   const containerPrefix = process.env.PIPELINE_CONTAINER_NAME_PREFIX ?? "scene-job";
+  const stageSlug = stageRunSlug(stage);
   const containerName = sanitizeContainerName(
-    `${containerPrefix}-${sceneId.toString()}-${jobId.toString()}`
+    `${containerPrefix}-${stageSlug}-${sceneId.toString()}-${jobId.toString()}`
   );
+  const workName = sanitizeContainerName(`${sceneId.toString()}-${jobId.toString()}-${stageSlug}`);
+  const containerWorkRoot = `/data/work/${workName}`;
   const dockerRm = String(process.env.PIPELINE_DOCKER_RM ?? "true").trim().toLowerCase() !== "false";
   const gpus = String(process.env.PIPELINE_DOCKER_GPUS ?? "all").trim();
+
+  await resetLocalPipelineWorkDir(dataRoot, workName);
 
   const args = ["run", "-d"];
   if (dockerRm) {
@@ -353,16 +757,25 @@ async function submitJobToLocalDocker({
   if (gpus && gpus.toLowerCase() !== "none") {
     args.push("--gpus", gpus);
   }
+  const dockerUser = getPipelineDockerUser();
+  if (dockerUser) {
+    args.push("--user", dockerUser);
+  }
   args.push("--name", containerName);
-  args.push("-v", `${storageRoot}:/data/storage`);
+  args.push("-v", `${dataRoot}:/data`);
   appendDockerEnv(args, "STORAGE_DRIVER", "local");
-  appendDockerEnv(args, "LOCAL_STORAGE_ROOT", "/data/storage");
+  appendDockerEnv(args, "LOCAL_STORAGE_ROOT", containerStorageRoot);
+  appendDockerEnv(args, "WORK", containerWorkRoot);
   appendDockerEnv(args, "SCENE_ID", sceneId.toString());
   appendDockerEnv(args, "JOB_ID", jobId.toString());
+  appendDockerEnv(args, "STAGE_RUN_ID", stageRunId?.toString?.() ?? stageRunId);
   appendDockerEnv(args, "UPLOAD_ID", uploadId);
   appendDockerEnv(args, "INPUT_VIDEO_KEY", inputVideoKey);
   appendDockerEnv(args, "PIPELINE", pipeline);
-  appendDockerEnv(args, "PIPELINE_STAGE", pipelineStage ?? pipelineToStage(pipeline));
+  appendDockerEnv(args, "PIPELINE_STAGE", stageSlug);
+  appendDockerEnv(args, "IMG", imageCount);
+  appendDockerEnv(args, "OVERLAP", overlap);
+  appendDockerEnv(args, "ITERS", iteration);
   appendDockerEnv(args, "KEYFRAME_SET_ID", keyframeSetId?.toString?.() ?? keyframeSetId);
   appendDockerEnv(args, "KEYFRAMES_PREFIX", keyframesPrefix);
   appendDockerEnv(args, "SOURCE_SFM_PREFIX", sourceSfmPrefix);
@@ -400,149 +813,20 @@ async function submitJobToLocalDocker({
   });
 }
 
-async function submitBatchJobToAws({
-  sceneId,
-  uploadId,
-  jobId,
-  imageCount,
-  overlap,
-  iteration,
-  pipeline,
-  bucketName,
-  keyframeSetId,
-  keyframesPrefix,
-  pipelineStage,
-  sourceSfmPrefix
-}) {
-  const jobQueue = process.env.BATCH_JOB_QUEUE;
-  const jobDefinition = process.env.BATCH_JOB_DEFINITION;
-  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
+function submitKsSfmJobToLocalDocker(args) {
+  return submitPipelineStageToLocalDocker({
+    ...args,
+    image: process.env.PIPELINE_KS_SFM_DOCKER_IMAGE ?? DEFAULT_KS_SFM_DOCKER_IMAGE,
+    stage: KS_SFM_STAGE_RUN
+  });
+}
 
-  if (!bucketName) {
-    throw new Error("S3_BUCKET_NAME 환경변수가 필요합니다.");
-  }
-
-  if (!jobQueue) {
-    throw new Error("BATCH_JOB_QUEUE 환경변수가 필요합니다.");
-  }
-
-  if (!jobDefinition) {
-    throw new Error("BATCH_JOB_DEFINITION 환경변수가 필요합니다.");
-  }
-
-  const batchSdk = await import("@aws-sdk/client-batch").catch(() => null);
-  if (!batchSdk) {
-    throw new Error("@aws-sdk/client-batch 패키지가 필요합니다.");
-  }
-
-  const { BatchClient, SubmitJobCommand } = batchSdk;
-  const batchClient = new BatchClient(region ? { region } : {});
-
-  const namePrefix = process.env.BATCH_JOB_NAME_PREFIX || "scene-job";
-  const rawJobName = `${namePrefix}-${sceneId.toString()}-${jobId.toString()}`;
-  const jobName = rawJobName.replace(/[^A-Za-z0-9-_]/g, "-").slice(0, 128);
-
-  const retryAttempts = Number.parseInt(String(process.env.BATCH_RETRY_ATTEMPTS ?? ""), 10);
-  const containerName =
-    process.env.BATCH_CONTAINER_NAME ?? process.env.BATCH_ECS_CONTAINER_NAME;
-
-  if (!containerName || containerName.trim().length === 0) {
-    throw new Error(
-      "BATCH_CONTAINER_NAME(또는 BATCH_ECS_CONTAINER_NAME) 환경변수가 필요합니다."
-    );
-  }
-
-  const environmentOverrides = [
-    {
-      name: "S3_BUCKET",
-      value: bucketName
-    },
-    {
-      name: "SCENE_ID",
-      value: sceneId.toString()
-    },
-    {
-      name: "UPLOAD_ID",
-      value: uploadId
-    },
-    {
-      name: "JOB_ID",
-      value: jobId.toString()
-    },
-    {
-      name: "IMG",
-      value: String(imageCount)
-    },
-    {
-      name: "OVERLAP",
-      value: String(overlap)
-    },
-    {
-      name: "ITERS",
-      value: String(iteration)
-    },
-    {
-      name: "PIPELINE",
-      value: pipeline
-    }
-  ];
-  if (pipelineStage) {
-    environmentOverrides.push({
-      name: "PIPELINE_STAGE",
-      value: pipelineStage
-    });
-  }
-  if (keyframeSetId) {
-    environmentOverrides.push({
-      name: "KEYFRAME_SET_ID",
-      value: keyframeSetId.toString()
-    });
-  }
-  if (keyframesPrefix) {
-    environmentOverrides.push({
-      name: "KEYFRAMES_PREFIX",
-      value: keyframesPrefix
-    });
-  }
-  if (sourceSfmPrefix) {
-    environmentOverrides.push({
-      name: "SOURCE_SFM_PREFIX",
-      value: sourceSfmPrefix
-    });
-  }
-
-  const submitInput = {
-    jobName,
-    jobQueue,
-    jobDefinition,
-    ecsPropertiesOverride: {
-      taskProperties: [
-        {
-          containers: [
-            {
-              name: containerName.trim(),
-              environment: environmentOverrides
-            }
-          ]
-        }
-      ]
-    }
-  };
-
-  if (Number.isFinite(retryAttempts) && retryAttempts > 0) {
-    submitInput.retryStrategy = {
-      attempts: retryAttempts
-    };
-  }
-
-  const command = new SubmitJobCommand(submitInput);
-  const response = await batchClient.send(command);
-
-  if (typeof response?.jobId !== "string" || response.jobId.trim().length === 0) {
-    throw new Error("AWS Batch jobId를 받지 못했습니다.");
-  }
-
-  return response.jobId.trim();
+function submitGsJobToLocalDocker(args) {
+  return submitPipelineStageToLocalDocker({
+    ...args,
+    image: process.env.PIPELINE_GS_DOCKER_IMAGE ?? DEFAULT_GS_DOCKER_IMAGE,
+    stage: GS_STAGE_RUN
+  });
 }
 
 async function refreshKeyframeSetFromStorage(keyframeSet) {
@@ -784,13 +1068,15 @@ async function serializeJob(job, readModel) {
     status: readModel.status,
     stage: readModel.stage,
     progress: readModel.progress,
+    cancelRequested: job.cancelRequested ?? false,
     imageCount: job.imageCount,
     overlap: job.overlap,
     iteration: job.iteration,
     createdAt: job.createdAt.toISOString(),
     updatedAt: readModel.updatedAt,
     finishedAt: readModel.finishedAt,
-    errorMessage: readModel.status === "failed" ? readModel.detail : null,
+    errorCode: job.errorCode ?? null,
+    errorMessage: readModel.status === "failed" || readModel.status === "canceled" ? readModel.detail : null,
     viewerReady: readModel.viewerReady,
     viewerKind: readModel.viewerKind,
     canRunGs: readModel.status === "waiting_gs" && Boolean(readModel.outputs.sfmResultKey),
@@ -963,6 +1249,352 @@ export async function listSceneJobs(req, res) {
   }
 }
 
+export async function deleteScene(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    if (sceneId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const runningJobCount = await prisma.jobs.count({
+      where: {
+        sceneId,
+        status: {
+          in: ["QUEUED", "SUBMITTED", "RUNNING"]
+        }
+      }
+    });
+    if (runningJobCount > 0) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "SCENE_HAS_RUNNING_JOBS",
+        "실행 중인 job이 있는 scene은 삭제할 수 없습니다."
+      );
+    }
+
+    const storageResults = await deleteStoragePrefixes([buildSceneStoragePrefix(sceneId)]);
+    await prisma.scenes.delete({
+      where: {
+        id: sceneId
+      }
+    });
+
+    return res.status(200).json({
+      ok: true,
+      sceneId: toResponseId(sceneId),
+      deletedStoragePrefixes: storageResults,
+      message: "scene이 삭제되었습니다."
+    });
+  } catch (err) {
+    if (err?.code === "P2025") {
+      return sendApiError(res, req, 404, "SCENE_NOT_FOUND", "scene을 찾을 수 없습니다.");
+    }
+    if (isStoragePermissionError(err)) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "STORAGE_DELETE_PERMISSION_DENIED",
+        "storage 파일 권한 때문에 scene을 삭제할 수 없습니다."
+      );
+    }
+
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "scene 삭제 실패");
+  }
+}
+
+export async function deleteSceneJob(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    const jobId = parseBigInt(req.params?.jobId);
+    if (sceneId === null || jobId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId, jobId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const job = await loadOwnedJob(sceneId, jobId);
+    if (!job) {
+      return sendApiError(res, req, 404, "JOB_NOT_FOUND", "job을 찾을 수 없습니다.");
+    }
+    if (isRunningJobStatus(job.status)) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "JOB_RUNNING",
+        "실행 중인 job은 삭제할 수 없습니다."
+      );
+    }
+
+    const storageResults = await deleteStoragePrefixes(buildJobStoragePrefixes(sceneId, jobId));
+    const scene = loadedScene.scene;
+    const jobSfmPrefix = buildSfmPrefix(sceneId, jobId);
+    const jobGsPrefix = `scenes/${sceneId.toString()}/gs/${jobId.toString()}`;
+    const jobThumbPrefix = `scenes/${sceneId.toString()}/thumb/${jobId.toString()}`;
+    const sceneUpdates = {};
+    if (scene.sfmResultKey?.startsWith(`${jobSfmPrefix}/`)) {
+      sceneUpdates.sfmResultKey = null;
+    }
+    if (scene.gaussianSplatKey?.startsWith(`${jobGsPrefix}/`)) {
+      sceneUpdates.gaussianSplatKey = null;
+    }
+    if (scene.meshKey?.startsWith(`${jobGsPrefix}/`)) {
+      sceneUpdates.meshKey = null;
+    }
+    if (scene.thumbnailKey?.startsWith(`${jobThumbPrefix}/`)) {
+      sceneUpdates.thumbnailKey = null;
+    }
+
+    const transaction = [
+      prisma.jobs.delete({
+        where: {
+          id: jobId
+        }
+      })
+    ];
+    if (Object.keys(sceneUpdates).length > 0) {
+      transaction.push(
+        prisma.scenes.update({
+          where: {
+            id: sceneId
+          },
+          data: sceneUpdates
+        })
+      );
+    }
+    await prisma.$transaction(transaction);
+
+    return res.status(200).json({
+      ok: true,
+      sceneId: toResponseId(sceneId),
+      jobId: toResponseId(jobId),
+      deletedStoragePrefixes: storageResults,
+      message: "job이 삭제되었습니다."
+    });
+  } catch (err) {
+    if (err?.code === "P2025") {
+      return sendApiError(res, req, 404, "JOB_NOT_FOUND", "job을 찾을 수 없습니다.");
+    }
+    if (isStoragePermissionError(err)) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "STORAGE_DELETE_PERMISSION_DENIED",
+        "storage 파일 권한 때문에 job을 삭제할 수 없습니다."
+      );
+    }
+
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "job 삭제 실패");
+  }
+}
+
+export async function cancelSceneJob(req, res) {
+  try {
+    const userId = parseBigInt(req.user?.id);
+    if (userId === null) {
+      return sendApiError(res, req, 401, "UNAUTHORIZED", "세션 사용자 정보가 유효하지 않습니다.");
+    }
+
+    if (!isLocalStorage()) {
+      return sendApiError(
+        res,
+        req,
+        400,
+        "LOCAL_PIPELINE_REQUIRED",
+        "job 중단은 local Docker 파이프라인에서만 지원됩니다."
+      );
+    }
+
+    const sceneId = parseBigInt(req.params?.sceneId);
+    const jobId = parseBigInt(req.params?.jobId);
+    if (sceneId === null || jobId === null) {
+      return sendApiError(res, req, 400, "BAD_REQUEST", "sceneId, jobId는 숫자여야 합니다.");
+    }
+
+    const loadedScene = await loadOwnedScene(sceneId, userId);
+    if (loadedScene.error) {
+      return sendApiError(
+        res,
+        req,
+        loadedScene.error.status,
+        loadedScene.error.code,
+        loadedScene.error.message
+      );
+    }
+
+    const job = await loadOwnedJob(sceneId, jobId);
+    if (!job) {
+      return sendApiError(res, req, 404, "JOB_NOT_FOUND", "job을 찾을 수 없습니다.");
+    }
+
+    if (job.status === "CANCELLED") {
+      return res.status(200).json({
+        ok: true,
+        sceneId: toResponseId(sceneId),
+        jobId: toResponseId(jobId),
+        status: "canceled",
+        message: "이미 중단된 job입니다."
+      });
+    }
+
+    if (!isCancelableJobStatus(job.status)) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "JOB_NOT_CANCELABLE",
+        "완료되었거나 실패한 job은 중단할 수 없습니다."
+      );
+    }
+
+    const stageRun = await findLatestActiveStageRun(job.id);
+    const stage = inferCancelableStage(job, stageRun);
+    await prisma.jobs.update({
+      where: {
+        id: job.id
+      },
+      data: {
+        cancelRequested: true,
+        errorCode: JOB_CANCELLED_ERROR_CODE,
+        errorMessage: JOB_CANCELLED_MESSAGE
+      }
+    });
+    await writeCancelMarker({
+      sceneId,
+      jobId,
+      stageRun,
+      stage
+    });
+
+    const dockerResult = stageRun?.containerId
+      ? await stopLocalDockerContainer(stageRun.containerId)
+      : {
+          stopped: false,
+          missing: false,
+          killed: false
+        };
+
+    const outputPrefixes = stage ? buildStageOutputPrefixes(sceneId, jobId, stage) : [];
+    const deletedStoragePrefixes = await deleteStoragePrefixes(outputPrefixes);
+    const endedAt = new Date();
+    const jobOutputData = buildJobOutputClearData(stage);
+    const sceneOutputData = buildSceneOutputClearData(loadedScene.scene, sceneId, jobId, stage);
+    const updates = [
+      prisma.jobs.update({
+        where: {
+          id: job.id
+        },
+        data: {
+          ...jobOutputData,
+          status: "CANCELLED",
+          cancelRequested: true,
+          endedAt,
+          errorCode: JOB_CANCELLED_ERROR_CODE,
+          errorMessage: JOB_CANCELLED_MESSAGE
+        }
+      })
+    ];
+
+    if (stageRun) {
+      updates.push(
+        prisma.job_stage_runs.update({
+          where: {
+            id: stageRun.id
+          },
+          data: {
+            status: "CANCELLED",
+            endedAt,
+            errorCode: JOB_CANCELLED_ERROR_CODE,
+            errorMessage: JOB_CANCELLED_MESSAGE
+          }
+        })
+      );
+    }
+
+    if (Object.keys(sceneOutputData).length > 0) {
+      updates.push(
+        prisma.scenes.update({
+          where: {
+            id: sceneId
+          },
+          data: sceneOutputData
+        })
+      );
+    }
+
+    await prisma.$transaction(updates);
+    await writeCancellationStatusDocs({
+      job: {
+        ...job,
+        status: "CANCELLED",
+        cancelRequested: true,
+        endedAt
+      },
+      stageRun,
+      stage
+    });
+
+    return res.status(200).json({
+      ok: true,
+      sceneId: toResponseId(sceneId),
+      jobId: toResponseId(jobId),
+      status: "canceled",
+      stage: stage ?? null,
+      docker: dockerResult,
+      deletedStoragePrefixes,
+      message: "job 중단을 요청했습니다."
+    });
+  } catch (err) {
+    if (isStoragePermissionError(err)) {
+      return sendApiError(
+        res,
+        req,
+        409,
+        "STORAGE_DELETE_PERMISSION_DENIED",
+        "storage 파일 권한 때문에 job 중단 정리를 완료할 수 없습니다."
+      );
+    }
+    console.error(err);
+    return sendApiError(res, req, 500, "INTERNAL_ERROR", "job 중단 실패");
+  }
+}
+
 export async function listSceneKeyframeSets(req, res) {
   try {
     const userId = parseBigInt(req.user?.id);
@@ -1075,35 +1707,32 @@ export async function createSceneKeyframeSet(req, res) {
     });
 
     let submittedJobId = null;
-    const runner = getPipelineRunner();
+    const runner = "local";
     const keys = buildKeyframeSetKeys(keyframeSet.storagePrefix);
+    let stageRun = null;
     try {
-      submittedJobId =
-        runner === "aws"
-          ? await submitBatchJobToAws({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: job.id,
-              imageCount: DEFAULT_AUTOMATED_IMAGE_COUNT,
-              overlap: DEFAULT_AUTOMATED_OVERLAP,
-              iteration,
-              pipeline: DEFAULT_PIPELINE,
-              bucketName: process.env.S3_BUCKET_NAME,
-              keyframeSetId: keyframeSet.id,
-              keyframesPrefix: keyframeSet.storagePrefix,
-              pipelineStage: "sfm"
-            })
-          : await submitJobToLocalDocker({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: job.id,
-              pipeline: DEFAULT_PIPELINE,
-              inputVideoKey: scene.inputVideoKey,
-              keyframeSetId: keyframeSet.id,
-              keyframesPrefix: keyframeSet.storagePrefix,
-              pipelineStage: "sfm"
-            });
+      stageRun = await createStageRunRecord({
+        jobId: job.id,
+        sceneId,
+        stage: KS_SFM_STAGE_RUN,
+        keyframesPrefix: keyframeSet.storagePrefix
+      });
+      submittedJobId = await submitKsSfmJobToLocalDocker({
+        sceneId,
+        uploadId: scene.uploadId,
+        jobId: job.id,
+        stageRunId: stageRun.id,
+        imageCount: DEFAULT_AUTOMATED_IMAGE_COUNT,
+        overlap: DEFAULT_AUTOMATED_OVERLAP,
+        iteration,
+        pipeline: DEFAULT_PIPELINE,
+        inputVideoKey: scene.inputVideoKey,
+        keyframeSetId: keyframeSet.id,
+        keyframesPrefix: keyframeSet.storagePrefix
+      });
+      await markStageRunSubmitted(stageRun.id, submittedJobId);
     } catch (submitErr) {
+      await markStageRunSubmitFailed(stageRun?.id, submitErr);
       await prisma.$transaction([
         prisma.jobs.update({
           where: {
@@ -1363,34 +1992,31 @@ export async function createSceneJob(req, res) {
     });
 
     let submittedJobId = null;
-    const runner = getPipelineRunner();
+    const runner = "local";
+    let stageRun = null;
     try {
-      submittedJobId =
-        runner === "aws"
-          ? await submitBatchJobToAws({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: created.id,
-              imageCount,
-              overlap,
-              iteration,
-              pipeline: DEFAULT_PIPELINE,
-              bucketName: process.env.S3_BUCKET_NAME,
-              keyframeSetId: jobKeyframeSet?.id ?? null,
-              keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
-              pipelineStage: "sfm"
-            })
-          : await submitJobToLocalDocker({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: created.id,
-              pipeline: DEFAULT_PIPELINE,
-              inputVideoKey: scene.inputVideoKey,
-              keyframeSetId: jobKeyframeSet?.id ?? null,
-              keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null,
-              pipelineStage: "sfm"
-            });
+      stageRun = await createStageRunRecord({
+        jobId: created.id,
+        sceneId,
+        stage: KS_SFM_STAGE_RUN,
+        keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null
+      });
+      submittedJobId = await submitKsSfmJobToLocalDocker({
+        sceneId,
+        uploadId: scene.uploadId,
+        jobId: created.id,
+        stageRunId: stageRun.id,
+        imageCount,
+        overlap,
+        iteration,
+        pipeline: DEFAULT_PIPELINE,
+        inputVideoKey: scene.inputVideoKey,
+        keyframeSetId: jobKeyframeSet?.id ?? null,
+        keyframesPrefix: jobKeyframeSet?.storagePrefix ?? null
+      });
+      await markStageRunSubmitted(stageRun.id, submittedJobId);
     } catch (submitErr) {
+      await markStageRunSubmitFailed(stageRun?.id, submitErr);
       const updates = [
         prisma.jobs.update({
           where: {
@@ -1569,36 +2195,32 @@ export async function runSceneJobGs(req, res) {
 
     const sourceSfmPrefix = buildSfmPrefix(sceneId, job.id);
     let submittedJobId = null;
-    const runner = getPipelineRunner();
+    const runner = "local";
+    let stageRun = null;
     try {
-      submittedJobId =
-        runner === "aws"
-          ? await submitBatchJobToAws({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: job.id,
-              imageCount: job.imageCount,
-              overlap: job.overlap,
-              iteration: job.iteration,
-              pipeline: DEFAULT_PIPELINE,
-              bucketName: process.env.S3_BUCKET_NAME,
-              keyframeSetId: job.keyframeSetId,
-              keyframesPrefix: job.keyframeSet?.storagePrefix ?? null,
-              pipelineStage: "gs",
-              sourceSfmPrefix
-            })
-          : await submitJobToLocalDocker({
-              sceneId,
-              uploadId: scene.uploadId,
-              jobId: job.id,
-              pipeline: DEFAULT_PIPELINE,
-              inputVideoKey: scene.inputVideoKey,
-              keyframeSetId: job.keyframeSetId,
-              keyframesPrefix: job.keyframeSet?.storagePrefix ?? null,
-              pipelineStage: "gs",
-              sourceSfmPrefix
-            });
+      stageRun = await createStageRunRecord({
+        jobId: job.id,
+        sceneId,
+        stage: GS_STAGE_RUN,
+        keyframesPrefix: job.keyframeSet?.storagePrefix ?? null
+      });
+      submittedJobId = await submitGsJobToLocalDocker({
+        sceneId,
+        uploadId: scene.uploadId,
+        jobId: job.id,
+        stageRunId: stageRun.id,
+        imageCount: job.imageCount,
+        overlap: job.overlap,
+        iteration: job.iteration,
+        pipeline: DEFAULT_PIPELINE,
+        inputVideoKey: scene.inputVideoKey,
+        keyframeSetId: job.keyframeSetId,
+        keyframesPrefix: job.keyframeSet?.storagePrefix ?? null,
+        sourceSfmPrefix
+      });
+      await markStageRunSubmitted(stageRun.id, submittedJobId);
     } catch (submitErr) {
+      await markStageRunSubmitFailed(stageRun?.id, submitErr);
       await prisma.jobs.update({
         where: {
           id: job.id
@@ -1863,7 +2485,8 @@ export async function getJobViewer(req, res) {
     }
 
     const readModel = await buildJobReadModel(job, {
-      bucketName: process.env.S3_BUCKET_NAME
+      bucketName: process.env.S3_BUCKET_NAME,
+      viewerKind: req.query?.view ?? req.query?.viewerKind ?? req.query?.kind
     });
     const postId = job.post ? toResponseId(job.post.id) : null;
     const thumbnail = await buildThumbnailSummary({

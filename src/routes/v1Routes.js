@@ -1,8 +1,11 @@
 import express from "express";
 import {
   activateSceneKeyframeSet,
+  cancelSceneJob,
   createSceneKeyframeSet,
   createSceneJob,
+  deleteScene,
+  deleteSceneJob,
   getJobViewer,
   getSceneJobProgress,
   getSceneJobStatus,
@@ -44,6 +47,12 @@ router.get(
   listSceneJobs
 );
 
+router.delete(
+  "/scenes/:sceneId",
+  sessionAuthV1Middleware,
+  deleteScene
+);
+
 router.get(
   "/scenes/:sceneId/keyframe-sets",
   sessionAuthV1Middleware,
@@ -72,6 +81,18 @@ router.post(
   "/scenes/:sceneId/jobs/:jobId/gs",
   sessionAuthV1Middleware,
   runSceneJobGs
+);
+
+router.post(
+  "/scenes/:sceneId/jobs/:jobId/cancel",
+  sessionAuthV1Middleware,
+  cancelSceneJob
+);
+
+router.delete(
+  "/scenes/:sceneId/jobs/:jobId",
+  sessionAuthV1Middleware,
+  deleteSceneJob
 );
 
 router.get(
